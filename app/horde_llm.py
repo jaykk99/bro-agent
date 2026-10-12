@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -32,8 +33,18 @@ from pydantic import PrivateAttr
 
 logger = logging.getLogger(__name__)
 
-HORDE_API = "https://stablehorde.net/api/v2"
+HORDE_APIS = [
+    "https://stablehorde.net/api/v2",
+    "https://aihorde.net/api/v2",
+]
 HORDE_ANON_KEY = "0000000000"
+HORDE_USER_AGENT = "bro-agent/1.0 (https://github.com/jaykk99/bro-agent)"
+
+
+def _horde_key() -> str:
+    """Anon key works keyless; a registered free Horde key (HORDE_API_KEY)
+    gets better queue priority and is less likely to be filtered."""
+    return os.environ.get("HORDE_API_KEY", "").strip() or HORDE_ANON_KEY
 
 # Uncensored models, most-likely-online first. Horde live-filters this list:
 # a job requesting only dead models sits in the queue forever, so passing
@@ -156,8 +167,16 @@ def _parse_tool_calls(text: str) -> tuple[str, list[dict]]:
 
 def _horde_generate(prompt: str, models: list[str], max_context_length: int,
                     max_length: int, temperature: float, timeout_s: int) -> str:
-    """Submit a prompt to AI Horde and poll until done. Raises on failure."""
-    headers = {"apikey": HORDE_ANON_KEY, "Content-Type": "application/json"}
+    """Submit a prompt to AI Horde and poll until done. Raises on failure.
+
+    Tries each known Horde API host in turn — some networks get 403s from
+    one host's edge (Cloudflare IP filtering) while the other works."""
+    api_key = _horde_key()
+    headers = {
+        "apikey": api_key,
+        "Content-Type": "application/json",
+        "User-Agent": HORDE_USER_AGENT,
+    }
     submit_body = {
         "prompt": prompt,
         "params": {
@@ -167,8 +186,22 @@ def _horde_generate(prompt: str, models: list[str], max_context_length: int,
         },
         "models": models,
     }
-    with httpx.Client(timeout=30) as client:
-        sub = client.post(f"{HORDE_API}/generate/text/async", headers=headers, json=submit_body)
+    last_error: Exception | None = None
+    for api in HORDE_APIS:
+        try:
+            return _horde_generate_on(api, headers, submit_body, timeout_s)
+        except RuntimeError as e:
+            logger.warning("horde: %s failed: %s", api, e)
+            last_error = e
+            continue
+    raise RuntimeError(f"horde: all endpoints failed (last: {last_error})")
+
+
+def _horde_generate_on(api: str, headers: dict, submit_body: dict, timeout_s: int) -> str:
+    with httpx.Client(timeout=30, headers={"User-Agent": HORDE_USER_AGENT}) as client:
+        sub = client.post(f"{api}/generate/text/async", headers=headers, json=submit_body)
+        if sub.status_code == 403:
+            raise RuntimeError("horde: 403 forbidden on submit (edge blocked this network)")
         if sub.status_code == 429:
             raise RuntimeError("horde: rate limited on submit (429)")
         sub.raise_for_status()
@@ -176,10 +209,13 @@ def _horde_generate(prompt: str, models: list[str], max_context_length: int,
         if not job_id:
             raise RuntimeError("horde: no job id returned")
 
+        poll_headers = {"apikey": headers["apikey"], "User-Agent": HORDE_USER_AGENT}
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             time.sleep(4)
-            chk = client.get(f"{HORDE_API}/generate/text/status/{job_id}", headers={"apikey": HORDE_ANON_KEY})
+            chk = client.get(f"{api}/generate/text/status/{job_id}", headers=poll_headers)
+            if chk.status_code == 403:
+                raise RuntimeError("horde: 403 forbidden on status poll")
             if chk.status_code != 200:
                 continue
             s = chk.json()
