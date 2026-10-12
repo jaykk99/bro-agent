@@ -51,7 +51,7 @@ def health():
 
     return {
         "ok": True,
-        "model": "venice" if _venice_key() else "pollinations",
+        "model": "venice" if _venice_key() else "horde",
         "venice_configured": bool(_venice_key()),
         "composio_configured": bool(os.environ.get("COMPOSIO_API_KEY", "").strip()),
         "access_gate": bool(_access_code()),

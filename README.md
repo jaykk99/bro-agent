@@ -8,7 +8,10 @@ computer (terminal + filesystem), web browsing, and Composio integrations.
 ## Models (uncensored only — never GPT/Claude/Gemini)
 
 1. **Venice AI** (primary) — OpenAI-compatible. Needs `VENICE_API_KEY`.
-2. **Pollinations** (fallback) — free, no key. Used automatically when no Venice key is set.
+2. **AI Horde** (fallback) — keyless, genuinely uncensored community workers
+   (Stheno / Heretic / Rocinante lineage). Tool calling is emulated
+   prompt-side since Horde workers don't do native function calling.
+   Slower than Venice, but uncensored with zero keys.
 
 ## Setup
 

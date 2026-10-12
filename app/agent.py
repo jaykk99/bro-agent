@@ -2,7 +2,9 @@
 
 Model chain (NEVER an aligned model — no GPT, no Claude, no Gemini):
   1. Venice AI (primary) — OpenAI-compatible, key from VENICE_API_KEY env.
-  2. Pollinations (fallback) — free OpenAI-compatible endpoint, no key.
+  2. AI Horde (fallback) — keyless, genuinely uncensored workers
+     (Stheno / Heretic / Rocinante lineage). Tool calling is emulated
+     prompt-side since Horde workers don't do native function calling.
 
 The agent gets a real computer (terminal + filesystem) via UniHarness's
 LocalNativeComputer, plus web tools and Composio.
@@ -17,7 +19,6 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 VENICE_API_URL = "https://api.venice.ai/api/v1"
-POLLINATIONS_API_URL = "https://text.pollinations.ai/openai"
 
 SYSTEM_PROMPT = """You are bro — Jay's personal AI agent. You get things done.
 
@@ -48,7 +49,7 @@ def _venice_model_name() -> str:
 
 
 def build_llm() -> tuple[Any, str]:
-    """Build the chat model. Returns (model, source_label). Venice primary, Pollinations fallback."""
+    """Build the chat model. Returns (model, source_label). Venice primary, Horde fallback."""
     from langchain_openai import ChatOpenAI
 
     key = _venice_key()
@@ -60,14 +61,10 @@ def build_llm() -> tuple[Any, str]:
             temperature=0.7,
         )
         return model, "venice"
-    # Fallback: free OpenAI-compatible endpoint, no key needed.
-    model = ChatOpenAI(
-        model="openai",
-        base_url=POLLINATIONS_API_URL,
-        api_key="not-needed",
-        temperature=0.7,
-    )
-    return model, "pollinations"
+    # Fallback: AI Horde, keyless uncensored workers, tool calling emulated.
+    from .horde_llm import HordeChatModel
+
+    return HordeChatModel(), "horde"
 
 
 async def create_bro_agent():
