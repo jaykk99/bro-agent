@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>bro</title>
+<style>
+  * { box-sizing: border-box; }
+  body { background:#0f172a; color:#e2e8f0; font-family:system-ui,sans-serif; margin:0; height:100vh; display:flex; flex-direction:column; }
+  header { padding:14px 20px; border-bottom:1px solid #1e293b; display:flex; justify-content:space-between; align-items:center; }
+  header h1 { margin:0; font-size:18px; color:#fff; }
+  #model-badge { font-size:12px; color:#64748b; }
+  #gate { padding:40px 20px; max-width:400px; margin:0 auto; text-align:center; }
+  #gate input { width:100%; padding:12px; margin:10px 0; background:#1e293b; border:1px solid #334155; border-radius:8px; color:#e2e8f0; font-size:15px; }
+  #gate button { width:100%; }
+  #chat { display:none; flex:1; flex-direction:column; max-width:900px; width:100%; margin:0 auto; }
+  #msgs { flex:1; overflow-y:auto; padding:20px; display:flex; flex-direction:column; gap:12px; }
+  .msg { padding:12px 16px; border-radius:12px; max-width:85%; white-space:pre-wrap; word-break:break-word; font-size:14px; line-height:1.5; }
+  .user { background:#1d4ed8; color:#fff; align-self:flex-end; }
+  .assistant { background:#1e293b; color:#e2e8f0; align-self:flex-start; }
+  .sys { color:#64748b; font-size:12px; align-self:center; }
+  #composer { display:flex; gap:10px; padding:16px 20px; border-top:1px solid #1e293b; }
+  #input { flex:1; background:#1e293b; border:1px solid #334155; border-radius:8px; color:#e2e8f0; padding:12px; font-size:15px; resize:none; font-family:inherit; }
+  button { background:#22d3ee; color:#0b1220; border:0; border-radius:8px; padding:12px 24px; font-size:15px; font-weight:700; cursor:pointer; }
+  button:disabled { opacity:.5; }
+  #threads { display:flex; gap:8px; padding:10px 20px; overflow-x:auto; border-bottom:1px solid #1e293b; }
+  #threads button { background:#1e293b; color:#94a3b8; padding:6px 12px; font-size:12px; font-weight:400; white-space:nowrap; }
+  #threads button.active { color:#22d3ee; border:1px solid #22d3ee; }
+</style>
+</head>
+<body>
+<header>
+  <h1>bro</h1>
+  <span id="model-badge">…</span>
+</header>
+
+<div id="gate">
+  <h2>Access code</h2>
+  <input type="password" id="code" placeholder="access code" autocomplete="off">
+  <button onclick="unlock()">Go</button>
+  <p id="gate-err" style="color:#f87171"></p>
+</div>
+
+<div id="chat">
+  <div id="threads"></div>
+  <div id="msgs"></div>
+  <div id="composer">
+    <textarea id="input" rows="2" placeholder="Ask anything…"></textarea>
+    <button id="send" onclick="send()">Send</button>
+  </div>
+</div>
+
+<script>
+let accessCode = sessionStorage.getItem('bro_code') || '';
+let threadId = '';
+let needGate = true;
+
+async function health() {
+  const r = await fetch('/api/health');
+  const h = await r.json();
+  document.getElementById('model-badge').textContent = 'model: ' + h.model + (h.venice_configured ? '' : ' (add VENICE_API_KEY for Venice)');
+  needGate = h.access_gate;
+  if (!needGate) { enter(); }
+  else if (accessCode) { enter(); }
+}
+
+function unlock() {
+  accessCode = document.getElementById('code').value;
+  sessionStorage.setItem('bro_code', accessCode);
+  enter();
+}
+
+function enter() {
+  document.getElementById('gate').style.display = 'none';
+  document.getElementById('chat').style.display = 'flex';
+  loadThreads();
+}
+
+async function loadThreads() {
+  const r = await fetch('/api/threads?access_code=' + encodeURIComponent(accessCode));
+  if (r.status === 401) { document.getElementById('gate-err').textContent = 'wrong code'; back_to_gate(); return; }
+  const d = await r.json();
+  const el = document.getElementById('threads');
+  el.innerHTML = '<button onclick="newThread()">+ new</button>';
+  d.threads.forEach(t => {
+    const b = document.createElement('button');
+    b.textContent = (t.title || 'chat').slice(0, 28);
+    b.onclick = () => { threadId = t.id; document.getElementById('msgs').innerHTML = ''; markActive(b); };
+    el.appendChild(b);
+  });
+}
+function markActive(b) { document.querySelectorAll('#threads button').forEach(x => x.classList.remove('active')); b.classList.add('active'); }
+function back_to_gate() { document.getElementById('gate').style.display = 'block'; document.getElementById('chat').style.display = 'none'; }
+function newThread() { threadId = ''; document.getElementById('msgs').innerHTML = ''; }
+
+function addMsg(role, text) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + role;
+  d.textContent = text;
+  document.getElementById('msgs').appendChild(d);
+  d.scrollIntoView();
+}
+
+async function send() {
+  const inp = document.getElementById('input');
+  const text = inp.value.trim();
+  if (!text) return;
+  inp.value = '';
+  document.getElementById('send').disabled = true;
+  addMsg('user', text);
+  const thinking = document.createElement('div');
+  thinking.className = 'msg sys';
+  thinking.textContent = 'working…';
+  document.getElementById('msgs').appendChild(thinking);
+
+  try {
+    const r = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message: text, thread_id: threadId, access_code: accessCode})
+    });
+    if (!r.ok) { thinking.textContent = 'error ' + r.status; return; }
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      const parts = buf.split('\n\n');
+      buf = parts.pop();
+      for (const p of parts) {
+        if (!p.startsWith('data: ')) continue;
+        const ev = JSON.parse(p.slice(6));
+        if (ev.type === 'thread') threadId = ev.thread_id;
+        if (ev.type === 'done') { thinking.remove(); addMsg('assistant', ev.reply); }
+        if (ev.type === 'error') { thinking.textContent = 'error: ' + ev.error; }
+      }
+    }
+  } catch (e) {
+    thinking.textContent = 'error: ' + e.message;
+  }
+  document.getElementById('send').disabled = false;
+}
+
+document.getElementById('input').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+document.getElementById('code').addEventListener('keydown', e => {
+  if (e.key === 'Enter') unlock();
+});
+health();
+</script>
+</body>
+</html>
