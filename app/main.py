@@ -5,6 +5,13 @@ Endpoints:
   GET  /api/health  — liveness + model source
   GET  /api/threads — list threads
   POST /api/chat    — chat turn (SSE stream). Body: {message, thread_id?, access_code}
+  POST /api/train   — queue a fine-tune job. Body: {model_repo, dataset?, lora_rank?, access_code}
+  GET  /api/train/list — recent training jobs (access_code query param)
+  GET  /api/train/{id} — one training job (access_code query param)
+  POST /api/train/claim — worker claims oldest queued job. Body: {access_code}
+  POST /api/train/{id}/complete — worker reports done/failed. Body: {access_code, status, ...}
+  POST /api/train/{id}/upload — worker uploads adapter file (multipart). Form: {file, access_code}
+  GET  /api/train/{id}/files/{name} — download an adapter file (access_code query param)
 """
 
 from __future__ import annotations
@@ -14,11 +21,12 @@ import json
 import logging
 import os
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from . import memory
+from . import train as train_jobs
 from .guards import check_hard_boundary
 
 logging.basicConfig(level=logging.INFO)
@@ -43,6 +51,25 @@ class ChatRequest(BaseModel):
     message: str
     thread_id: str = ""
     access_code: str = ""
+
+
+class TrainCreateRequest(BaseModel):
+    model_repo: str
+    dataset: str = ""
+    lora_rank: int = 16
+    access_code: str = ""
+
+
+class TrainClaimRequest(BaseModel):
+    access_code: str = ""
+
+
+class TrainCompleteRequest(BaseModel):
+    access_code: str = ""
+    status: str = ""
+    result_url: str = ""
+    metrics: dict = {}
+    error: str = ""
 
 
 @app.get("/api/health")
@@ -111,6 +138,78 @@ async def chat(req: ChatRequest):
             yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+# ---- Pull-based GPU training jobs (train-studio system, inside bro-agent) ----
+
+
+@app.post("/api/train")
+def train_create(req: TrainCreateRequest):
+    _check_access(req.access_code)
+    model_repo = (req.model_repo or "").strip()
+    if not model_repo:
+        raise HTTPException(status_code=400, detail="model_repo is required")
+    job_id = train_jobs.create_job(model_repo, (req.dataset or "").strip(), req.lora_rank)
+    return {"job_id": job_id}
+
+
+@app.get("/api/train/list")
+def train_list(access_code: str = ""):
+    _check_access(access_code)
+    return {"jobs": train_jobs.list_jobs()}
+
+
+@app.get("/api/train/{job_id}")
+def train_get(job_id: str, access_code: str = ""):
+    _check_access(access_code)
+    job = train_jobs.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
+
+
+@app.post("/api/train/claim")
+def train_claim(req: TrainClaimRequest):
+    _check_access(req.access_code)
+    job = train_jobs.claim_job()
+    if not job:
+        raise HTTPException(status_code=404, detail="no queued jobs")
+    return job
+
+
+@app.post("/api/train/{job_id}/complete")
+def train_complete(job_id: str, req: TrainCompleteRequest):
+    _check_access(req.access_code)
+    if req.status not in ("done", "failed"):
+        raise HTTPException(status_code=400, detail="status must be done or failed")
+    ok = train_jobs.complete_job(job_id, req.status, req.result_url, req.metrics or None, req.error)
+    if not ok:
+        raise HTTPException(status_code=404, detail="job not found")
+    return {"ok": True}
+
+
+@app.post("/api/train/{job_id}/upload")
+async def train_upload(job_id: str, file: UploadFile = File(...), access_code: str = Form("")):
+    _check_access(access_code)
+    if not train_jobs.get_job(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+    dest = train_jobs.adapter_file_path(job_id, file.filename or "adapter.bin")
+    with open(dest, "wb") as f:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+    return {"ok": True, "filename": os.path.basename(dest)}
+
+
+@app.get("/api/train/{job_id}/files/{filename}")
+def train_file(job_id: str, filename: str, access_code: str = ""):
+    _check_access(access_code)
+    dest = train_jobs.adapter_file_path(job_id, filename)
+    if not os.path.isfile(dest):
+        raise HTTPException(status_code=404, detail="file not found")
+    return FileResponse(dest)
 
 
 if __name__ == "__main__":
