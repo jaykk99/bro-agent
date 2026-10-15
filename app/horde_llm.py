@@ -10,8 +10,8 @@ function calling, so this module emulates it the classic ReAct way:
   * _generate parses those blocks into AIMessage.tool_calls so LangGraph's
     ToolNode executes them like native tool calls.
 
-Model chain for bro-agent: Venice (keyed, primary) -> Horde (keyless,
-uncensored fallback). Never an aligned model.
+Model chain for bro-agent: Pollinations (keyless primary) -> Horde (keyless
+fallback). Never an aligned model.
 """
 
 from __future__ import annotations
@@ -46,16 +46,16 @@ def _horde_key() -> str:
     gets better queue priority and is less likely to be filtered."""
     return os.environ.get("HORDE_API_KEY", "").strip() or HORDE_ANON_KEY
 
-# Uncensored models, most-likely-online first. Horde live-filters this list:
-# a job requesting only dead models sits in the queue forever, so passing
-# several real options keeps it moving.
+# Uncensored models, most-workers-online first (verified 2026-10-15).
+# Horde live-filters this list: a job requesting only dead models sits in
+# the queue forever, so passing several real options keeps it moving.
 HORDE_UNCENSORED_MODELS = [
     "koboldcpp/L3-8B-Stheno-v3.2",
-    "koboldcpp/Rocinante-X-12B",
-    "koboldcpp/Magidonia-24B-v4.3",
-    "koboldcpp/mini-magnum-12b-v1.1",
-    "aphrodite/TheDrummer/Skyfall-31B-v4.2",
+    "koboldcpp/Rocinante-X-12B-v1",
     "koboldcpp/gemma-4-31B-it-heretic",
+    "koboldcpp/gemma-4-26B-A4B-it-heretic",
+    "koboldcpp/Gemma-4-E4B-it-Ultra-Uncensored-Heretic",
+    "koboldcpp/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M",
 ]
 
 TOOL_CALL_FENCE_RE = re.compile(r"```tool_call\s*\n?(.*?)```", re.DOTALL)

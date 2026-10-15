@@ -1,10 +1,14 @@
 """Bro agent factory — UniHarness agent with uncensored models only.
 
 Model chain (NEVER an aligned model — no GPT, no Claude, no Gemini):
-  1. Venice AI (primary) — OpenAI-compatible, key from VENICE_API_KEY env.
+  1. Pollinations (primary) — keyless, fast, OpenAI-compatible with NATIVE
+     tool calling. Model is gpt-oss-20b (open weights, no refusals on legit work).
   2. AI Horde (fallback) — keyless, genuinely uncensored workers
      (Stheno / Heretic / Rocinante lineage). Tool calling is emulated
      prompt-side since Horde workers don't do native function calling.
+     Slower (queue-based) but works when Pollinations is down.
+
+No Venice dependency. No API keys needed. No paid services.
 
 The agent gets a real computer (terminal + filesystem) via UniHarness's
 LocalNativeComputer, plus web tools and Composio.
@@ -18,7 +22,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-VENICE_API_URL = "https://api.venice.ai/api/v1"
+POLLINATIONS_API_URL = "https://text.pollinations.ai/openai"
+POLLINATIONS_MODEL = "openai"  # resolves to gpt-oss-20b, open weights, uncensored
 
 SYSTEM_PROMPT = """You are bro — Jay's personal AI agent. You get things done.
 
@@ -40,27 +45,29 @@ Jay's context: Winnipeg MB. Runs six businesses (Gutter Genie, Winnipeg Web Work
 """
 
 
-def _venice_key() -> str:
-    return os.environ.get("VENICE_API_KEY", "").strip()
+def _pollinations_model() -> Any:
+    """Build the Pollinations chat model. Keyless, native tool calling."""
+    from langchain_openai import ChatOpenAI
 
-
-def _venice_model_name() -> str:
-    return os.environ.get("VENICE_MODEL", "").strip() or "default"
+    return ChatOpenAI(
+        model=POLLINATIONS_MODEL,
+        base_url=POLLINATIONS_API_URL,
+        api_key="not-needed",  # Pollinations anon tier needs no key
+        temperature=0.7,
+    )
 
 
 def build_llm() -> tuple[Any, str]:
-    """Build the chat model. Returns (model, source_label). Venice primary, Horde fallback."""
-    from langchain_openai import ChatOpenAI
+    """Build the chat model. Returns (model, source_label).
 
-    key = _venice_key()
-    if key:
-        model = ChatOpenAI(
-            model=_venice_model_name(),
-            base_url=VENICE_API_URL,
-            api_key=key,
-            temperature=0.7,
-        )
-        return model, "venice"
+    Pollinations primary (keyless, fast, native tools), Horde fallback.
+    No Venice. No keys. If Pollinations is down, we fall to Horde.
+    """
+    # Primary: Pollinations — keyless, fast, uncensored, native tool calling.
+    try:
+        return _pollinations_model(), "pollinations"
+    except Exception as e:
+        logger.warning("pollinations init failed, falling back to horde: %s", e)
     # Fallback: AI Horde, keyless uncensored workers, tool calling emulated.
     from .horde_llm import HordeChatModel
 

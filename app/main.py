@@ -12,6 +12,11 @@ Endpoints:
   POST /api/train/{id}/complete — worker reports done/failed. Body: {access_code, status, ...}
   POST /api/train/{id}/upload — worker uploads adapter file (multipart). Form: {file, access_code}
   GET  /api/train/{id}/files/{name} — download an adapter file (access_code query param)
+  POST /api/forge/workers/register — worker registers (platform colab/kaggle). Body: {platform, access_code}
+  POST /api/forge/workers/heartbeat — worker heartbeat. Body: {worker_id, current_job_id?, access_code}
+  POST /api/forge/workers/{id}/finished — worker reports job done (clears current job). Body: {access_code}
+  GET  /api/forge/workers — dispatcher status: workers alive per platform + queue depth (access_code query param)
+  POST /api/forge/dispatch/reap — reap dead workers, re-queue their stuck jobs. Body: {access_code}
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ from pydantic import BaseModel
 
 from . import memory
 from . import train as train_jobs
+from . import dispatch as forge_dispatch
 from .guards import check_hard_boundary
 
 logging.basicConfig(level=logging.INFO)
@@ -74,12 +80,12 @@ class TrainCompleteRequest(BaseModel):
 
 @app.get("/api/health")
 def health():
-    from .agent import _venice_key
-
     return {
         "ok": True,
-        "model": "venice" if _venice_key() else "horde",
-        "venice_configured": bool(_venice_key()),
+        "model": "pollinations",
+        "pollinations_primary": True,
+        "horde_fallback": True,
+        "venice_removed": True,
         "composio_configured": bool(os.environ.get("COMPOSIO_API_KEY", "").strip()),
         "access_gate": bool(_access_code()),
     }
@@ -210,6 +216,56 @@ def train_file(job_id: str, filename: str, access_code: str = ""):
     if not os.path.isfile(dest):
         raise HTTPException(status_code=404, detail="file not found")
     return FileResponse(dest)
+
+
+class ForgeWorkerRegisterRequest(BaseModel):
+    platform: str = ""
+    access_code: str = ""
+
+
+class ForgeWorkerHeartbeatRequest(BaseModel):
+    worker_id: str = ""
+    current_job_id: str = ""
+    access_code: str = ""
+
+
+# ---- Forge worker dispatcher (Colab + Kaggle registry, heartbeats, reaper) ----
+
+
+@app.post("/api/forge/workers/register")
+def forge_worker_register(req: ForgeWorkerRegisterRequest):
+    _check_access(req.access_code)
+    worker_id = forge_dispatch.register_worker(req.platform)
+    return {"worker_id": worker_id}
+
+
+@app.post("/api/forge/workers/heartbeat")
+def forge_worker_heartbeat(req: ForgeWorkerHeartbeatRequest):
+    _check_access(req.access_code)
+    ok = forge_dispatch.heartbeat(req.worker_id, req.current_job_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="unknown worker_id")
+    return {"ok": True}
+
+
+@app.post("/api/forge/workers/{worker_id}/finished")
+def forge_worker_finished(worker_id: str, req: ForgeWorkerHeartbeatRequest):
+    _check_access(req.access_code)
+    forge_dispatch.job_finished(worker_id)
+    forge_dispatch.heartbeat(worker_id, "")
+    return {"ok": True}
+
+
+@app.get("/api/forge/workers")
+def forge_workers(access_code: str = ""):
+    _check_access(access_code)
+    return forge_dispatch.status_snapshot()
+
+
+@app.post("/api/forge/dispatch/reap")
+def forge_dispatch_reap(req: ForgeWorkerHeartbeatRequest):
+    _check_access(req.access_code)
+    return forge_dispatch.reap_dead_workers()
 
 
 if __name__ == "__main__":
