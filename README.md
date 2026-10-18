@@ -42,3 +42,13 @@ Everything else: zero refusal boilerplate.
 
 SQLite at `./data/bro.db` (or `BRO_DB_PATH`). Threads persist across restarts
 on persistent disks; Render free-tier disk is ephemeral.
+
+## Live URLs
+
+- Uncensored Harness: https://uncensored-harness-production.up.railway.app
+- Error Inbox: https://error-inbox.onrender.com
+- Bro Agent: https://bro-agent.onrender.com
+- ReconAnything: https://recon-anything.onrender.com
+- Kaggle Runner: https://kaggle-colab-runner.jayomer1234.workers.dev
+- Linux Remote App: https://linux-remote-app.onrender.com
+- Linux Remote Repo: https://github.com/jaykk99/linux-remote
