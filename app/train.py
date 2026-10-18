@@ -140,6 +140,26 @@ def complete_job(
         return cur.rowcount > 0
 
 
+def requeue_job(job_id: str) -> bool:
+    """Move a 'working' job back to 'queued' (its worker died). Returns False
+    if the job is not currently 'working' (finished jobs are never touched)."""
+    c = _connect()
+    with _lock:
+        cur = c.execute(
+            "UPDATE train_jobs SET status='queued', updated_at=? WHERE id=? AND status='working'",
+            (time.time(), job_id),
+        )
+        c.commit()
+        return cur.rowcount > 0
+
+
+def count_queued_jobs() -> int:
+    """Queue depth for the forge dispatcher status snapshot."""
+    c = _connect()
+    row = c.execute("SELECT COUNT(*) FROM train_jobs WHERE status='queued'").fetchone()
+    return int(row[0]) if row else 0
+
+
 def adapter_file_path(job_id: str, filename: str) -> str:
     """Sanitized on-disk path for an uploaded adapter file (path traversal safe)."""
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(filename or ""))[:128] or "file"
