@@ -7,19 +7,21 @@ computer (terminal + filesystem), web browsing, and Composio integrations.
 
 ## Models (uncensored only — never GPT/Claude/Gemini)
 
-1. **Venice AI** (primary) — OpenAI-compatible. Needs `VENICE_API_KEY`.
-2. **AI Horde** (fallback) — keyless, genuinely uncensored community workers
+1. **Pollinations** (primary): keyless, OpenAI-compatible, native tool
+   calling. Open weights, no refusals on legit work. No API key needed.
+2. **AI Horde** (fallback): keyless, genuinely uncensored community workers
    (Stheno / Heretic / Rocinante lineage). Tool calling is emulated
    prompt-side since Horde workers don't do native function calling.
-   Slower than Venice, but uncensored with zero keys.
+   Slower than Pollinations, but uncensored with zero keys. A free
+   `HORDE_API_KEY` (optional) gets better queue priority.
 
 ## Setup
 
 ```bash
 pip install -r requirements.txt
-export VENICE_API_KEY=...        # optional but recommended
 export COMPOSIO_API_KEY=...      # optional
 export BRO_ACCESS_CODE=...       # optional access gate for the UI
+export HORDE_API_KEY=...         # optional, better Horde queue priority
 uvicorn app.main:app --port 8000
 ```
 
@@ -27,8 +29,8 @@ Open http://localhost:8000.
 
 ## Deploy (Render)
 
-`render.yaml` is included. Set `VENICE_API_KEY`, `COMPOSIO_API_KEY`, and
-`BRO_ACCESS_CODE` in the Render dashboard (never commit keys).
+`render.yaml` is included. Set `COMPOSIO_API_KEY` and `BRO_ACCESS_CODE` in
+the Render dashboard (`HORDE_API_KEY` optional). Never commit keys.
 
 ## Guardrails
 

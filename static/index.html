@@ -58,7 +58,7 @@ let needGate = true;
 async function health() {
   const r = await fetch('/api/health');
   const h = await r.json();
-  document.getElementById('model-badge').textContent = 'model: ' + h.model + (h.venice_configured ? '' : ' (add VENICE_API_KEY for Venice)');
+  document.getElementById('model-badge').textContent = 'model: ' + h.model + (h.horde_fallback ? ' (fallback: horde)' : '');
   needGate = h.access_gate;
   if (!needGate) { enter(); }
   else if (accessCode) { enter(); }

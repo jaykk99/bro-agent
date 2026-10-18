@@ -15,7 +15,7 @@ Ported from error-inbox PR #209 (lib/bro/harness.ts). Design: multi-signal
 matchers (ACTION + CRIMINAL OBJECT). Bare keywords NEVER match — "memory
 dump", "checkout validation", "audio mixing", "mock login", "cold storage
 move", "bath bomb", "nuke the test db" all pass. This is a backstop only;
-the model (Venice) handles its own refusals. Each guard carries a plain
+the model handles its own refusals. Each guard carries a plain
 1-line reason + the nearest legitimate alternative, no lecture.
 """
 
