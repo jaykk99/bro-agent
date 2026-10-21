@@ -175,6 +175,7 @@
           <button id="send" class="primary" onclick="send()">Send</button>
           <span id="char-count"></span>
         </div>
+        <label id="upload-btn" title="attach a file" style="cursor:pointer;font-size:18px;color:var(--faint);padding:8px;">📎<input type="file" id="file-input" style="display:none"></label>
       </div>
       <div class="hint">Enter to send · Shift+Enter for a new line</div>
     </div>
@@ -491,6 +492,24 @@ input.addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
 $("code").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); unlock(); } });
+$("file-input").addEventListener("change", async ev => {
+  const f = ev.target.files[0];
+  if (!f) return;
+  ev.target.value = "";
+  const fd = new FormData();
+  fd.append("file", f);
+  fd.append("access_code", accessCode);
+  try {
+    const r = await api("/api/upload", { method: "POST", body: fd });
+    const d = await r.json();
+    if (r.ok) {
+      $("input").value += ( $("input").value ? "\n" : "" ) + "[attached: " + d.path + "]";
+      autoGrow(); updateCount(); $("input").focus();
+    } else {
+      addError("upload failed: " + (d.detail || r.status), false);
+    }
+  } catch (e) { addError("upload failed: " + e.message, false); }
+});
 
 /* ---------- boot ---------- */
 if (accessCode) { $("code").value = accessCode; unlock(); }

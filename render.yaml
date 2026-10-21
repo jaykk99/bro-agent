@@ -13,3 +13,4 @@ services:
         sync: false
       - key: BRO_WORKDIR
         value: /opt/render/project/src/bro-work
+    healthCheckPath: /api/health

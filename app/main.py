@@ -109,10 +109,16 @@ def health():
 
 @app.get("/api/models")
 def models(access_code: str = ""):
-    """Provider chain status: health, failure counts, cooldowns."""
+    """Provider chain status: health, failure counts, cooldowns, Horde models."""
     _check_access(access_code)
     router = get_router()
-    return {"order": router.preferred_order(), "providers": router.status()}
+    from .horde_llm import HORDE_UNCENSORED_MODELS, resolve_models
+
+    return {
+        "order": router.preferred_order(),
+        "providers": router.status(),
+        "horde_models": resolve_models(HORDE_UNCENSORED_MODELS),
+    }
 
 
 @app.get("/api/stats")
@@ -278,7 +284,9 @@ async def chat(req: ChatRequest, request: Request):
         for i, provider in enumerate(order):
             try:
                 agent, source = await create_bro_agent(preferred=provider)
-                result = await agent.ainvoke({"messages": messages})
+                # Bound the turn: a hung provider must not hang the SSE stream forever.
+                turn_timeout = float(os.environ.get("BRO_TURN_TIMEOUT_S", "600"))
+                result = await asyncio.wait_for(agent.ainvoke({"messages": messages}), timeout=turn_timeout)
                 out_messages = result["messages"] if isinstance(result, dict) else []
                 text = ""
                 if out_messages:

@@ -39,6 +39,25 @@ status, metrics, adapter download  <----  /api/train/{id}/files/adapter_model.sa
 - `POST /api/train/{id}/complete` — worker only. Body: `{access_code, status: "done"|"failed", result_url?, metrics?, error?}`
 - `POST /api/train/{id}/upload` — worker only. Multipart form: `file` + `access_code`. Filenames are sanitized server-side (path traversal safe)
 - `GET /api/train/{id}/files/{name}?access_code=` — download an adapter file
+- `POST /api/train/{id}/retry` — re-queue a `failed` job (body: `{access_code}`).
+  Attempts are tracked per job and capped at 3 — a poison job stops retrying
+  instead of spinning forever
+- `POST /api/train/reap-stuck` — re-queue jobs stuck in `working` whose worker
+  vanished (body: `{access_code}`). Covers direct `/api/train/claim` users the
+  forge reaper can't see
+
+## Worker reliability (forge dispatcher)
+
+The worker notebook registers itself at
+`POST /api/forge/workers/register` (platform auto-detected: colab/kaggle/other)
+and sends a heartbeat every 30s carrying its current job id
+(`POST /api/forge/workers/heartbeat`). When it finishes a job it reports
+`POST /api/forge/workers/{id}/finished`.
+
+If heartbeats stop for 10 minutes, `POST /api/forge/dispatch/reap` marks the
+worker dead and re-queues its stuck job (`working` → `queued`, attempts+1).
+The ops dashboard in the UI shows alive/dead workers per platform, queue
+depth, and has reap buttons — or call the endpoints directly.
 
 ## Why this shape
 
