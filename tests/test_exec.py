@@ -109,8 +109,14 @@ def test_bg_kill(_workdir):
     out = run(StartBgTool(), command="sleep 30", timeout_s=60)
     jid = out.split("started job")[1].split(":")[0].strip()
     assert "killed job" in run(BgKillTool(), job_id=jid)
-    time.sleep(0.5)
-    assert "EXITED" in run(BgPollTool(), job_id=jid)
+    # poll until the reaper thread records the exit (no fixed-sleep race)
+    end = ""
+    for _ in range(50):
+        end = run(BgPollTool(), job_id=jid)
+        if "EXITED" in end:
+            break
+        time.sleep(0.1)
+    assert "EXITED" in end
 
 
 def test_bg_unknown_job(_workdir):

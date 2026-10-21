@@ -162,6 +162,7 @@ class _BgJob:
         self.returncode: int | None = None
         self.error = ""
         self._lock = threading.Lock()
+        self._kill_requested = False
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -177,6 +178,9 @@ class _BgJob:
                 text=True,
                 env=_safe_env(),
             )
+            # A kill() that landed before Popen was assigned must still take effect.
+            if self._kill_requested:
+                self.proc.kill()
             try:
                 out, _ = self.proc.communicate(timeout=self.timeout_s)
             except subprocess.TimeoutExpired:
@@ -204,6 +208,10 @@ class _BgJob:
             }
 
     def kill(self) -> None:
+        # Record the request first: kill() may run before the worker thread
+        # has assigned self.proc (Popen not yet spawned) — _run() honors the
+        # flag right after spawning so the kill is never lost.
+        self._kill_requested = True
         if self.proc and self.proc.poll() is None:
             self.proc.kill()
 
