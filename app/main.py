@@ -110,6 +110,39 @@ def threads(access_code: str = ""):
     return {"threads": memory.list_threads()}
 
 
+@app.get("/api/threads/{thread_id}")
+def thread_messages(thread_id: str, access_code: str = ""):
+    _check_access(access_code)
+    if not memory.thread_exists(thread_id):
+        raise HTTPException(status_code=404, detail="thread not found")
+    return {"messages": memory.get_thread_messages(thread_id)}
+
+
+class ThreadRenameRequest(BaseModel):
+    title: str = ""
+    access_code: str = ""
+
+
+@app.post("/api/threads/{thread_id}/rename")
+def thread_rename(thread_id: str, req: ThreadRenameRequest):
+    _check_access(req.access_code)
+    if not memory.rename_thread(thread_id, req.title):
+        raise HTTPException(status_code=404, detail="thread not found or empty title")
+    return {"ok": True}
+
+
+class ThreadDeleteRequest(BaseModel):
+    access_code: str = ""
+
+
+@app.delete("/api/threads/{thread_id}")
+def thread_delete(thread_id: str, access_code: str = ""):
+    _check_access(access_code)
+    if not memory.delete_thread(thread_id):
+        raise HTTPException(status_code=404, detail="thread not found")
+    return {"ok": True}
+
+
 @app.get("/")
 def index():
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
