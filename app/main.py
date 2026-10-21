@@ -34,6 +34,7 @@ from . import memory
 from . import train as train_jobs
 from . import dispatch as forge_dispatch
 from .guards import check_hard_boundary
+from .router import get_router, looks_like_refusal
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -80,15 +81,25 @@ class TrainCompleteRequest(BaseModel):
 
 @app.get("/api/health")
 def health():
+    router = get_router()
     return {
         "ok": True,
         "model": "pollinations",
         "pollinations_primary": True,
         "horde_fallback": True,
         "venice_removed": True,
+        "providers": router.status(),
         "composio_configured": bool(os.environ.get("COMPOSIO_API_KEY", "").strip()),
         "access_gate": bool(_access_code()),
     }
+
+
+@app.get("/api/models")
+def models(access_code: str = ""):
+    """Provider chain status: health, failure counts, cooldowns."""
+    _check_access(access_code)
+    router = get_router()
+    return {"order": router.preferred_order(), "providers": router.status()}
 
 
 @app.get("/api/threads")
@@ -126,22 +137,40 @@ async def chat(req: ChatRequest):
         from .agent import create_bro_agent
 
         yield f"data: {json.dumps({'type': 'thread', 'thread_id': thread_id})}\n\n"
-        try:
-            agent, source = await create_bro_agent()
-            messages = [{"role": m["role"], "content": m["content"]} for m in history]
-            result = await agent.ainvoke({"messages": messages})
-            out_messages = result["messages"] if isinstance(result, dict) else []
-            text = ""
-            if out_messages:
-                last = out_messages[-1]
-                text = getattr(last, "content", "") or str(last)
-            memory.add_message(thread_id, "assistant", text)
-            yield f"data: {json.dumps({'type': 'done', 'reply': text, 'model': source})}\n\n"
-        except Exception as e:
-            logger.exception("agent turn failed")
-            err = f"Agent error: {e}"
+        router = get_router()
+        order = router.preferred_order()
+        messages = [{"role": m["role"], "content": m["content"]} for m in history]
+        final_text, final_source, final_error = "", "", ""
+        # Walk the provider chain: on hard error OR refusal boilerplate from
+        # a fallback model (Jay's standing order — never show Jay a refusal
+        # on legit work), move to the next provider instead of giving up.
+        for i, provider in enumerate(order):
+            try:
+                agent, source = await create_bro_agent(preferred=provider)
+                result = await agent.ainvoke({"messages": messages})
+                out_messages = result["messages"] if isinstance(result, dict) else []
+                text = ""
+                if out_messages:
+                    last = out_messages[-1]
+                    text = getattr(last, "content", "") or str(last)
+                if looks_like_refusal(text) and i < len(order) - 1:
+                    logger.warning("provider %s refused legit work, skipping to next", source)
+                    router.record_failure(source)
+                    continue
+                router.record_success(source)
+                final_text, final_source = text, source
+                break
+            except Exception as e:
+                logger.exception("agent turn failed on %s", provider)
+                router.record_failure(provider)
+                final_error = str(e)
+        if final_text:
+            memory.add_message(thread_id, "assistant", final_text)
+            yield f"data: {json.dumps({'type': 'done', 'reply': final_text, 'model': final_source})}\n\n"
+        else:
+            err = f"Agent error: {final_error or 'all providers failed'}"
             memory.add_message(thread_id, "assistant", err)
-            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'error': final_error or 'all providers failed'})}\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 

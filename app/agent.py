@@ -57,25 +57,37 @@ def _pollinations_model() -> Any:
     )
 
 
-def build_llm() -> tuple[Any, str]:
+def build_llm(order: tuple[str, ...] = ("pollinations", "horde")) -> tuple[Any, str]:
     """Build the chat model. Returns (model, source_label).
 
-    Pollinations primary (keyless, fast, native tools), Horde fallback.
-    No Venice. No keys. If Pollinations is down, we fall to Horde.
+    Tries providers in `order`; first one that initializes wins. Callers
+    (via the router) pass the healthy-first order; the default keeps the
+    classic pollinations-primary, horde-fallback chain.
     """
-    # Primary: Pollinations — keyless, fast, uncensored, native tool calling.
-    try:
-        return _pollinations_model(), "pollinations"
-    except Exception as e:
-        logger.warning("pollinations init failed, falling back to horde: %s", e)
-    # Fallback: AI Horde, keyless uncensored workers, tool calling emulated.
-    from .horde_llm import HordeChatModel
+    last_error: Exception | None = None
+    for name in order:
+        try:
+            if name == "pollinations":
+                # Keyless, fast, uncensored, native tool calling.
+                return _pollinations_model(), "pollinations"
+            if name == "horde":
+                # Keyless uncensored workers, tool calling emulated.
+                from .horde_llm import HordeChatModel
 
-    return HordeChatModel(), "horde"
+                return HordeChatModel(), "horde"
+            logger.warning("build_llm: unknown provider %r, skipping", name)
+        except Exception as e:
+            logger.warning("build_llm: %s init failed: %s", name, e)
+            last_error = e
+    raise RuntimeError(f"no LLM provider available (tried {order}, last error: {last_error})")
 
 
-async def create_bro_agent():
-    """Create the UniHarness bro agent. Call once and reuse (or per-request)."""
+async def create_bro_agent(preferred: str | None = None):
+    """Create the UniHarness bro agent. Call once and reuse (or per-request).
+
+    `preferred` optionally forces one provider ("pollinations" or "horde");
+    otherwise the classic chain order is used.
+    """
     from uniharness import ModelProfile, create_agent
     from uniharness.computer import LocalNativeComputer
 
@@ -84,7 +96,8 @@ async def create_bro_agent():
     from .tools_files import file_tools
     from .tools_web import web_tools
 
-    llm, source = build_llm()
+    order = (preferred,) if preferred else ("pollinations", "horde")
+    llm, source = build_llm(order)
     logger.info("bro agent model source: %s", source)
 
     profile = ModelProfile(model=llm, context_window=128_000)
