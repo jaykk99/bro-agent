@@ -26,14 +26,16 @@ import json
 import logging
 import os
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from . import memory
 from . import train as train_jobs
 from . import dispatch as forge_dispatch
+from .context import build_window
 from .guards import check_hard_boundary
+from . import rate_limit
 from .router import get_router, looks_like_refusal
 
 logging.basicConfig(level=logging.INFO)
@@ -114,8 +116,19 @@ def index():
 
 
 @app.post("/api/chat")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, request: Request):
     _check_access(req.access_code)
+    # Rate limit: per access code when the gate is on, else per client IP.
+    client_ip = request.client.host if request.client else "unknown"
+    rate_key = f"code:{req.access_code}" if _access_code() else f"ip:{client_ip}"
+    try:
+        rate_limit.check(rate_key)
+    except rate_limit.RateLimited as e:
+        raise HTTPException(
+            status_code=429,
+            detail="too many requests",
+            headers={"Retry-After": str(int(e.retry_after_s) + 1)},
+        )
     message = (req.message or "").strip()
     if not message:
         raise HTTPException(status_code=400, detail="empty message")
@@ -139,7 +152,7 @@ async def chat(req: ChatRequest):
         yield f"data: {json.dumps({'type': 'thread', 'thread_id': thread_id})}\n\n"
         router = get_router()
         order = router.preferred_order()
-        messages = [{"role": m["role"], "content": m["content"]} for m in history]
+        messages = [{"role": m["role"], "content": m["content"]} for m in build_window(history)]
         final_text, final_source, final_error = "", "", ""
         # Walk the provider chain: on hard error OR refusal boilerplate from
         # a fallback model (Jay's standing order — never show Jay a refusal
