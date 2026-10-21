@@ -59,6 +59,66 @@ HORDE_UNCENSORED_MODELS = [
     "koboldcpp/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M",
 ]
 
+# Live model refresh: the hardcoded list above goes stale as workers come
+# and go. resolve_models() asks the Horde API which uncensored models have
+# workers online right now (cached 6h), falling back to the hardcoded list
+# when the API is unreachable.
+MODELS_CACHE_S = 6 * 3600
+_UNCENSORED_HINTS = ("stheno", "heretic", "rocinante", "uncensored")
+_models_cache: tuple[float, list[str]] | None = None
+
+
+def _fetch_live_models(http_get=None) -> list[str]:
+    """Query the Horde model list; return online uncensored model names."""
+    get = http_get or httpx.get
+    r = get(
+        "https://stablehorde.net/api/v2/status/models",
+        headers={"User-Agent": HORDE_USER_AGENT},
+        timeout=15,
+    )
+    r.raise_for_status()
+    data = r.json()
+    items = data if isinstance(data, list) else []
+    live: list[tuple[int, str]] = []
+    for it in items:
+        name = str(it.get("name", ""))
+        workers = int(it.get("count", 0) or 0)
+        if workers <= 0:
+            continue
+        lname = name.lower()
+        if any(h in lname for h in _UNCENSORED_HINTS):
+            # prefer koboldcpp-served models (text gen), then most workers
+            prio = 0 if lname.startswith("koboldcpp/") else 1
+            live.append((prio, -workers, name))
+    live.sort()
+    return [name for _, _, name in live]
+
+
+def resolve_models(configured: list[str], http_get=None) -> list[str]:
+    """Resolve which Horde models to request.
+
+    When the caller uses the default list, refresh it against the live
+    Horde API (6h cache) so jobs don't queue forever on dead models.
+    Custom lists are used as-is. Never returns empty — falls back to the
+    hardcoded list when the API fails.
+    """
+    global _models_cache
+    if configured != HORDE_UNCENSORED_MODELS:
+        return configured
+    now = time.time()
+    if _models_cache and now - _models_cache[0] < MODELS_CACHE_S:
+        return _models_cache[1]
+    try:
+        live = _fetch_live_models(http_get)
+        if live:
+            _models_cache = (now, live)
+            logger.info("horde: refreshed model list (%d live uncensored)", len(live))
+            return live
+    except Exception as e:
+        logger.warning("horde: live model refresh failed, using defaults: %s", e)
+    _models_cache = (now, HORDE_UNCENSORED_MODELS)
+    return HORDE_UNCENSORED_MODELS
+
 TOOL_CALL_FENCE_RE = re.compile(r"```tool_call\s*\n?(.*?)```", re.DOTALL)
 TOOL_CALL_JSON_RE = re.compile(r"\{[^{}]*\"name\"\s*:\s*\"([^\"]+)\"[^{}]*\}", re.DOTALL)
 
@@ -337,7 +397,7 @@ class HordeChatModel(BaseChatModel):
         logger.info("horde: submitting prompt (%d chars)", len(prompt))
         text = _horde_generate(
             prompt,
-            models=self.horde_models,
+            models=resolve_models(self.horde_models),
             max_context_length=self.max_context_length,
             max_length=self.max_length,
             temperature=self.temperature,
@@ -363,7 +423,7 @@ class HordeChatModel(BaseChatModel):
         logger.info("horde: submitting prompt async (%d chars)", len(prompt))
         text = await _ahorde_generate(
             prompt,
-            models=self.horde_models,
+            models=resolve_models(self.horde_models),
             max_context_length=self.max_context_length,
             max_length=self.max_length,
             temperature=self.temperature,

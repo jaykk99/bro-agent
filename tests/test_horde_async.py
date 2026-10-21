@@ -281,3 +281,55 @@ def test_agenerate_end_to_end(monkeypatch):
     msg = result.generations[0].message
     assert msg.content.strip() == "Sure."
     assert msg.tool_calls[0]["name"] == "file_read"
+
+
+# ---- live model refresh ----
+
+def _fake_http_get(payload, status=200):
+    class R:
+        status_code = status
+
+        def raise_for_status(self):
+            if status >= 400:
+                raise RuntimeError(f"HTTP {status}")
+
+        def json(self):
+            return payload
+
+    def get(url, headers=None, timeout=None):
+        return R()
+
+    return get
+
+
+def test_resolve_models_custom_list_passthrough():
+    horde._models_cache = None
+    custom = ["koboldcpp/MyModel"]
+    assert horde.resolve_models(custom) == custom
+
+
+def test_resolve_models_live_refresh(monkeypatch):
+    horde._models_cache = None
+    payload = [
+        {"name": "koboldcpp/L3-8B-Stheno-v3.2", "count": 12},
+        {"name": "koboldcpp/dead-model", "count": 0},  # no workers -> excluded
+        {"name": "koboldcpp/gpt4-aligned", "count": 30},  # not uncensored -> excluded
+        {"name": "aphrodite/My-Heretic-Merge", "count": 5},
+    ]
+    got = horde.resolve_models(horde.HORDE_UNCENSORED_MODELS, http_get=_fake_http_get(payload))
+    assert got == ["koboldcpp/L3-8B-Stheno-v3.2", "aphrodite/My-Heretic-Merge"]
+    # cached: second call must not hit the network (boom getter)
+    def boom(*a, **k):
+        raise AssertionError("should use cache")
+
+    assert horde.resolve_models(horde.HORDE_UNCENSORED_MODELS, http_get=boom) == got
+
+
+def test_resolve_models_falls_back_on_api_failure():
+    horde._models_cache = None
+
+    def bad(*a, **k):
+        raise RuntimeError("network down")
+
+    got = horde.resolve_models(horde.HORDE_UNCENSORED_MODELS, http_get=bad)
+    assert got == horde.HORDE_UNCENSORED_MODELS
