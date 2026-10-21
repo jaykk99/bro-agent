@@ -120,3 +120,32 @@ def test_search(root):
     assert "one.txt:1" in out and "two.txt:1" in out
     assert "No matches" in run(FileSearchTool(), pattern="zebra")
     assert "Bad regex" in run(FileSearchTool(), pattern="([")
+
+
+def test_append_move_copy_delete_stat(root):
+    from app.tools_files import (
+        FileAppendTool,
+        FileCopyTool,
+        FileDeleteTool,
+        FileMoveTool,
+        FileStatTool,
+    )
+
+    run(FileWriteTool(), path="a.txt", content="one\n")
+    assert "Appended" in run(FileAppendTool(), path="a.txt", content="two\n")
+    assert "two" in run(FileReadTool(), path="a.txt")
+    assert "Moved" in run(FileMoveTool(), src="a.txt", dest="sub/b.txt")
+    assert "Not a file" in run(FileReadTool(), path="a.txt")
+    assert "Copied" in run(FileCopyTool(), src="sub/b.txt", dest="c.txt")
+    assert "one" in run(FileReadTool(), path="c.txt")
+    out = run(FileStatTool(), path="c.txt")
+    assert "file" in out and "bytes" in out
+    assert "Destination exists" in run(FileCopyTool(), src="sub/b.txt", dest="c.txt")
+    assert "Deleted" in run(FileDeleteTool(), path="c.txt")
+    assert "Not a file" in run(FileDeleteTool(), path="c.txt")
+    # directories are never deleted by file_delete
+    run(FileMkdirTool(), path="d")
+    assert "Not a file" in run(FileDeleteTool(), path="d")
+    # sandbox still applies
+    assert run(FileDeleteTool(), path="../x").startswith("Blocked:")
+    assert run(FileMoveTool(), src="sub/b.txt", dest="../../evil").startswith("Blocked:")

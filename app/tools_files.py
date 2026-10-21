@@ -253,6 +253,152 @@ class FileMkdirTool(BaseAgentTool[FileMkdirParams]):
         return ToolResult(output=f"Created {display_path(root, p)}/")
 
 
+class FileAppendParams(BaseModel):
+    path: str = Field(description="Path to append to, relative to the workdir")
+    content: str = Field(description="Text to append (created if missing)")
+
+
+class FileAppendTool(BaseAgentTool[FileAppendParams]):
+    name: str = "file_append"
+    description: str = "Append text to the end of a file (creates it if missing)."
+    args_schema = FileAppendParams
+
+    async def execute(self, params: FileAppendParams) -> ToolResult:
+        root = workdir()
+        try:
+            p = resolve(root, params.path)
+        except SandboxViolation as e:
+            return ToolResult(output=f"Blocked: {e}")
+        data = params.content.encode("utf-8")
+        if len(data) > WRITE_MAX_BYTES:
+            return ToolResult(output=f"Blocked: content exceeds {WRITE_MAX_BYTES} byte cap")
+        try:
+            if os.path.isfile(p) and os.path.getsize(p) + len(data) > WRITE_MAX_BYTES:
+                return ToolResult(output="Blocked: append would exceed the file size cap")
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(params.content)
+        except OSError as e:
+            return ToolResult(output=f"Append failed: {e}")
+        return ToolResult(output=f"Appended {len(data)} bytes to {display_path(root, p)}")
+
+
+class FileMoveParams(BaseModel):
+    src: str = Field(description="Source path, relative to the workdir")
+    dest: str = Field(description="Destination path, relative to the workdir")
+
+
+class FileMoveTool(BaseAgentTool[FileMoveParams]):
+    name: str = "file_move"
+    description: str = "Move/rename a file or directory inside the workdir."
+    args_schema = FileMoveParams
+
+    async def execute(self, params: FileMoveParams) -> ToolResult:
+        root = workdir()
+        try:
+            src = resolve(root, params.src)
+            dest = resolve(root, params.dest)
+        except SandboxViolation as e:
+            return ToolResult(output=f"Blocked: {e}")
+        if not os.path.exists(src):
+            return ToolResult(output=f"Not found: {display_path(root, src)}")
+        if os.path.exists(dest):
+            return ToolResult(output=f"Destination exists, not overwriting: {display_path(root, dest)}")
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            os.rename(src, dest)
+        except OSError as e:
+            return ToolResult(output=f"Move failed: {e}")
+        return ToolResult(output=f"Moved {display_path(root, src)} -> {display_path(root, dest)}")
+
+
+class FileCopyParams(BaseModel):
+    src: str = Field(description="Source path, relative to the workdir")
+    dest: str = Field(description="Destination path, relative to the workdir")
+
+
+class FileCopyTool(BaseAgentTool[FileCopyParams]):
+    name: str = "file_copy"
+    description: str = "Copy a file inside the workdir (never overwrites)."
+    args_schema = FileCopyParams
+
+    async def execute(self, params: FileCopyParams) -> ToolResult:
+        import shutil
+
+        root = workdir()
+        try:
+            src = resolve(root, params.src)
+            dest = resolve(root, params.dest)
+        except SandboxViolation as e:
+            return ToolResult(output=f"Blocked: {e}")
+        if not os.path.isfile(src):
+            return ToolResult(output=f"Not a file: {display_path(root, src)}")
+        if os.path.exists(dest):
+            return ToolResult(output=f"Destination exists, not overwriting: {display_path(root, dest)}")
+        if os.path.getsize(src) > WRITE_MAX_BYTES:
+            return ToolResult(output="Blocked: file exceeds the copy size cap")
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.copy2(src, dest)
+        except OSError as e:
+            return ToolResult(output=f"Copy failed: {e}")
+        return ToolResult(output=f"Copied {display_path(root, src)} -> {display_path(root, dest)}")
+
+
+class FileDeleteParams(BaseModel):
+    path: str = Field(description="File to delete, relative to the workdir")
+
+
+class FileDeleteTool(BaseAgentTool[FileDeleteParams]):
+    name: str = "file_delete"
+    description: str = "Delete one file in the workdir. Directories are never deleted by this tool."
+    args_schema = FileDeleteParams
+
+    async def execute(self, params: FileDeleteParams) -> ToolResult:
+        root = workdir()
+        try:
+            p = resolve(root, params.path)
+        except SandboxViolation as e:
+            return ToolResult(output=f"Blocked: {e}")
+        if not os.path.isfile(p):
+            return ToolResult(output=f"Not a file: {display_path(root, p)}")
+        try:
+            os.unlink(p)
+        except OSError as e:
+            return ToolResult(output=f"Delete failed: {e}")
+        return ToolResult(output=f"Deleted {display_path(root, p)}")
+
+
+class FileStatParams(BaseModel):
+    path: str = Field(description="Path to inspect, relative to the workdir")
+
+
+class FileStatTool(BaseAgentTool[FileStatParams]):
+    name: str = "file_stat"
+    description: str = "Show size, type, and modification time of a path."
+    args_schema = FileStatParams
+
+    async def execute(self, params: FileStatParams) -> ToolResult:
+        import datetime
+
+        root = workdir()
+        try:
+            p = resolve(root, params.path)
+        except SandboxViolation as e:
+            return ToolResult(output=f"Blocked: {e}")
+        if not os.path.exists(p):
+            return ToolResult(output=f"Not found: {display_path(root, p)}")
+        try:
+            st = os.stat(p)
+        except OSError as e:
+            return ToolResult(output=f"stat failed: {e}")
+        kind = "dir" if os.path.isdir(p) else "file"
+        mtime = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+        return ToolResult(
+            output=f"{display_path(root, p)}: {kind}, {st.st_size} bytes, modified {mtime}"
+        )
+
+
 def file_tools() -> list[Any]:
     return [
         FileReadTool(),
@@ -261,4 +407,9 @@ def file_tools() -> list[Any]:
         FileListTool(),
         FileSearchTool(),
         FileMkdirTool(),
+        FileAppendTool(),
+        FileMoveTool(),
+        FileCopyTool(),
+        FileDeleteTool(),
+        FileStatTool(),
     ]
