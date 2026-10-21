@@ -33,6 +33,8 @@ def test_models_endpoint():
     assert r.status_code == 200
     d = r.json()
     assert d["order"][0] == "pollinations"
+    assert "horde_models" in d
+    assert "X-Request-ID" in r.headers  # logging middleware
 
 
 def test_index_serves_ui():
@@ -120,3 +122,27 @@ def test_hard_boundary_still_blocks_without_llm():
     d = r.json()
     assert d["blocked"] is True
     assert d["reply"]
+
+
+def test_chat_rejects_oversize_message():
+    rate_limit.reset_for_tests()
+    r = client.post("/api/chat", json={"message": "x" * 20001, "access_code": ""})
+    assert r.status_code == 400
+    assert "too long" in r.json()["detail"]
+
+
+def test_claim_rate_limited_after_burst(monkeypatch):
+    rate_limit.reset_for_tests()
+    # hammer claim past the burst; eventually 429 (not 404)
+    statuses = set()
+    for _ in range(rate_limit.BURST + 3):
+        r = client.post("/api/train/claim", json={"access_code": ""})
+        statuses.add(r.status_code)
+    assert 429 in statuses
+
+
+def test_cli_imports():
+    import app.cli as cli
+
+    assert callable(cli.chat_stream)
+    assert cli.BASE.startswith("http")

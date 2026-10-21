@@ -56,6 +56,29 @@ app = FastAPI(title="bro-agent")
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "static")
 
+# Bound absurd inputs before they touch the model or the DB.
+MAX_MESSAGE_CHARS = 20_000
+
+
+@app.middleware("http")
+async def request_log_middleware(request: Request, call_next):
+    """Structured per-request log: method, path, status, ms. No bodies."""
+    import uuid as _uuid
+
+    rid = _uuid.uuid4().hex[:8]
+    start = time.monotonic()
+    try:
+        response = await call_next(request)
+        status = response.status_code
+    except Exception:
+        status = 500
+        raise
+    finally:
+        ms = (time.monotonic() - start) * 1000
+        logger.info("req=%s %s %s -> %s %.1fms", rid, request.method, request.url.path, status, ms)
+    response.headers["X-Request-ID"] = rid
+    return response
+
 
 def _access_code() -> str:
     return os.environ.get("BRO_ACCESS_CODE", "").strip()
@@ -112,12 +135,18 @@ def models(access_code: str = ""):
     """Provider chain status: health, failure counts, cooldowns, Horde models."""
     _check_access(access_code)
     router = get_router()
-    from .horde_llm import HORDE_UNCENSORED_MODELS, resolve_models
+    horde_models: list[str] = []
+    try:
+        from .horde_llm import HORDE_UNCENSORED_MODELS, resolve_models
+
+        horde_models = resolve_models(HORDE_UNCENSORED_MODELS)
+    except Exception as e:  # langchain_core missing in dep-free envs
+        logger.warning("horde model list unavailable: %s", e)
 
     return {
         "order": router.preferred_order(),
         "providers": router.status(),
-        "horde_models": resolve_models(HORDE_UNCENSORED_MODELS),
+        "horde_models": horde_models,
     }
 
 
@@ -256,6 +285,8 @@ async def chat(req: ChatRequest, request: Request):
     message = (req.message or "").strip()
     if not message:
         raise HTTPException(status_code=400, detail="empty message")
+    if len(message) > MAX_MESSAGE_CHARS:
+        raise HTTPException(status_code=400, detail=f"message too long ({MAX_MESSAGE_CHARS} char cap)")
 
     # Hard-boundary pre-check (surgical guards only — legit work always passes).
     hit = check_hard_boundary(message)
@@ -345,8 +376,14 @@ def train_get(job_id: str, access_code: str = ""):
 
 
 @app.post("/api/train/claim")
-def train_claim(req: TrainClaimRequest):
+def train_claim(req: TrainClaimRequest, request: Request):
     _check_access(req.access_code)
+    # Workers poll every ~30s; bound it so a hot loop can't hammer the DB.
+    ip = request.client.host if request.client else "unknown"
+    try:
+        rate_limit.check(f"claim:{ip}")
+    except rate_limit.RateLimited:
+        raise HTTPException(status_code=429, detail="claim too often", headers={"Retry-After": "5"})
     job = train_jobs.claim_job()
     if not job:
         raise HTTPException(status_code=404, detail="no queued jobs")
