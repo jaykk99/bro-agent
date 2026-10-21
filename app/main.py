@@ -2,14 +2,23 @@
 
 Endpoints:
   GET  /            — chat UI
-  GET  /api/health  — liveness + model source
+  GET  /api/health  — liveness + model source + provider status
+  GET  /api/models  — provider chain status (order, health, cooldowns)
+  GET  /api/stats   — per-day/per-provider usage counts (access_code query param)
   GET  /api/threads — list threads
+  GET  /api/threads/{id} — thread messages with timestamps
+  POST /api/threads/{id}/rename — rename a thread. Body: {title, access_code}
+  DELETE /api/threads/{id} — delete a thread and its messages
+  GET  /api/threads/{id}/export — thread as a Markdown download
   POST /api/chat    — chat turn (SSE stream). Body: {message, thread_id?, access_code}
+  POST /api/upload  — upload a file into workdir/uploads/. Form: {file, access_code}
   POST /api/train   — queue a fine-tune job. Body: {model_repo, dataset?, lora_rank?, access_code}
   GET  /api/train/list — recent training jobs (access_code query param)
   GET  /api/train/{id} — one training job (access_code query param)
   POST /api/train/claim — worker claims oldest queued job. Body: {access_code}
   POST /api/train/{id}/complete — worker reports done/failed. Body: {access_code, status, ...}
+  POST /api/train/{id}/retry — re-queue a failed job (attempts+1, capped). Body: {access_code}
+  POST /api/train/reap-stuck — re-queue 'working' jobs whose worker vanished. Body: {access_code}
   POST /api/train/{id}/upload — worker uploads adapter file (multipart). Form: {file, access_code}
   GET  /api/train/{id}/files/{name} — download an adapter file (access_code query param)
   POST /api/forge/workers/register — worker registers (platform colab/kaggle). Body: {platform, access_code}

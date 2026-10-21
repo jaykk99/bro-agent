@@ -112,6 +112,26 @@
   #side-toggle { display:none; background:none; border:1px solid var(--line); color:var(--dim);
                  border-radius:6px; padding:6px 10px; font-size:13px; cursor:pointer; }
 
+  /* ops dashboard */
+  #ops { display:none; flex:1; overflow-y:auto; padding:20px; }
+  #ops.open { display:block; }
+  #ops-inner { max-width:900px; margin:0 auto; display:flex; flex-direction:column; gap:16px; }
+  .ops-card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .ops-card h3 { margin:0 0 10px; font-size:14px; color:#fff; display:flex; justify-content:space-between; align-items:center; }
+  .ops-card table { width:100%; border-collapse:collapse; font-size:12px; }
+  .ops-card th { text-align:left; color:var(--faint); font-weight:500; padding:6px 8px; border-bottom:1px solid var(--line); }
+  .ops-card td { padding:6px 8px; border-bottom:1px solid #263449; color:var(--dim); }
+  .ops-card td:first-child { color:var(--txt); font-family:ui-monospace,Menlo,monospace; font-size:11px; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; }
+  .pill.queued { background:#1e3a5f; color:#7dd3fc; }
+  .pill.working { background:#4a3a12; color:#fbbf24; }
+  .pill.done { background:#123f2a; color:#4ade80; }
+  .pill.failed { background:#4a1d1d; color:#f87171; }
+  .mini-btn { background:none; border:1px solid var(--line); color:var(--dim); border-radius:5px;
+              font-size:11px; padding:3px 9px; cursor:pointer; }
+  .mini-btn:hover { color:var(--accent); border-color:var(--accent); }
+  .ops-empty { color:var(--faint); font-size:12px; padding:8px 0; }
+
   @media (max-width:720px) {
     #sidebar { position:absolute; z-index:10; height:100%; left:0; top:0; bottom:0;
                transform:translateX(-100%); transition:transform .2s; }
@@ -127,6 +147,7 @@
   <div style="display:flex;gap:10px;align-items:center">
     <button id="side-toggle" onclick="document.getElementById('sidebar').classList.toggle('open')">☰</button>
     <h1>bro</h1>
+    <button id="view-toggle" onclick="toggleOps()" style="display:none;background:none;border:1px solid var(--line);color:var(--dim);border-radius:6px;padding:6px 10px;font-size:12px;cursor:pointer">ops</button>
   </div>
   <span id="model-badge"><span class="dot"></span><span id="model-name">connecting…</span></span>
 </header>
@@ -156,6 +177,22 @@
         </div>
       </div>
       <div class="hint">Enter to send · Shift+Enter for a new line</div>
+    </div>
+  </div>
+  <div id="ops">
+    <div id="ops-inner">
+      <div class="ops-card">
+        <h3>Train jobs <span><button class="mini-btn" onclick="reapStuck()">reap stuck</button> <button class="mini-btn" onclick="loadOps()">refresh</button></span></h3>
+        <div id="ops-jobs"><div class="ops-empty">loading…</div></div>
+      </div>
+      <div class="ops-card">
+        <h3>Forge workers <span><button class="mini-btn" onclick="reapWorkers()">reap dead</button></span></h3>
+        <div id="ops-workers"><div class="ops-empty">loading…</div></div>
+      </div>
+      <div class="ops-card">
+        <h3>Usage</h3>
+        <div id="ops-stats"><div class="ops-empty">loading…</div></div>
+      </div>
     </div>
   </div>
 </div>
@@ -243,6 +280,7 @@ async function unlock() {
     localStorage.setItem("bro_code", code);
     $("gate").style.display = "none";
     $("app").classList.add("open");
+    $("view-toggle").style.display = "block";
     await refreshModels();
     await loadThreads();
     if (!threadId) newThread(true);
@@ -456,6 +494,58 @@ $("code").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventD
 
 /* ---------- boot ---------- */
 if (accessCode) { $("code").value = accessCode; unlock(); }
+
+/* ---------- ops dashboard ---------- */
+let opsOpen = false;
+function toggleOps() {
+  opsOpen = !opsOpen;
+  $("sidebar").style.display = opsOpen ? "none" : "";
+  $("main").style.display = opsOpen ? "none" : "";
+  $("ops").classList.toggle("open", opsOpen);
+  $("view-toggle").textContent = opsOpen ? "chat" : "ops";
+  if (opsOpen) loadOps();
+}
+async function loadOps() {
+  const q = "?access_code=" + encodeURIComponent(accessCode);
+  try {
+    const jobs = await (await api("/api/train/list" + q)).json();
+    const list = jobs.jobs || [];
+    $("ops-jobs").innerHTML = list.length ? `<table><tr><th>job</th><th>model</th><th>status</th><th>attempts</th><th></th></tr>` +
+      list.slice(0, 20).map(j => `<tr><td>${j.id.slice(0, 8)}</td><td>${esc(j.model_repo || "")}</td>` +
+        `<td><span class="pill ${j.status}">${j.status}</span></td><td>${j.attempts || 0}</td>` +
+        `<td>${j.status === "failed" ? `<button class="mini-btn" onclick="retryJob('${j.id}')">retry</button>` : ""}</td></tr>`).join("") + `</table>`
+      : `<div class="ops-empty">no train jobs yet</div>`;
+  } catch (e) { $("ops-jobs").innerHTML = `<div class="ops-empty">failed to load</div>`; }
+  try {
+    const w = await (await api("/api/forge/workers" + q)).json();
+    const plats = Object.entries(w.platforms || {}).map(([p, n]) => `${p}: ${n}`).join(", ") || "none";
+    $("ops-workers").innerHTML = `<table><tr><th>alive</th><th>dead</th><th>platforms</th><th>queued jobs</th></tr>` +
+      `<tr><td>${w.alive}</td><td>${w.dead}</td><td>${esc(plats)}</td><td>${w.queued_jobs}</td></tr></table>`;
+  } catch (e) { $("ops-workers").innerHTML = `<div class="ops-empty">failed to load</div>`; }
+  try {
+    const s = await (await api("/api/stats" + q)).json();
+    const rows = s.stats || [];
+    $("ops-stats").innerHTML = rows.length ? `<table><tr><th>day</th><th>provider</th><th>turns</th><th>in chars</th><th>out chars</th></tr>` +
+      rows.slice(0, 28).map(r => `<tr><td>${r.day}</td><td>${esc(r.provider)}</td><td>${r.turns}</td><td>${r.in_chars}</td><td>${r.out_chars}</td></tr>`).join("") + `</table>`
+      : `<div class="ops-empty">no usage yet</div>`;
+  } catch (e) { $("ops-stats").innerHTML = `<div class="ops-empty">failed to load</div>`; }
+}
+async function retryJob(id) {
+  await api("/api/train/" + id + "/retry", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ access_code: accessCode }) });
+  loadOps();
+}
+async function reapStuck() {
+  const r = await api("/api/train/reap-stuck", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ access_code: accessCode }) });
+  const d = await r.json();
+  alert("re-queued " + (d.requeued || []).length + " stuck job(s)");
+  loadOps();
+}
+async function reapWorkers() {
+  const r = await api("/api/forge/dispatch/reap", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ access_code: accessCode }) });
+  const d = await r.json();
+  alert("reaped " + d.reaped + " worker(s), re-queued " + (d.requeued || []).length + " job(s)");
+  loadOps();
+}
 </script>
 </body>
 </html>
