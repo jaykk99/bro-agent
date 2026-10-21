@@ -80,6 +80,8 @@ async def create_bro_agent():
     from uniharness.computer import LocalNativeComputer
 
     from .tools_composio import composio_tools
+    from .tools_exec import exec_tools
+    from .tools_files import file_tools
     from .tools_web import web_tools
 
     llm, source = build_llm()
@@ -90,6 +92,8 @@ async def create_bro_agent():
     extra_tools: list[Any] = []
     extra_tools.extend(web_tools())
     extra_tools.extend(composio_tools())
+    extra_tools.extend(file_tools())
+    extra_tools.extend(exec_tools())
 
     workdir = os.environ.get("BRO_WORKDIR", os.path.expanduser("~/bro-work"))
     os.makedirs(workdir, exist_ok=True)
