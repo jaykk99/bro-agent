@@ -64,9 +64,12 @@ Force-push, hard reset, `clean -f`, and history rewrites are refused in code.
 
 Markdown rendering (code blocks with copy buttons), thread sidebar with
 rename/delete, timestamps, per-message copy, typing indicator naming the
-active provider, error retry, rate-limit notice, and an **ops dashboard**:
-train-job queue (retry/reap), forge worker status, and usage stats.
-Access code is remembered in the browser.
+active provider, error retry, rate-limit notice, file attach button, and an
+**ops dashboard**: train-job queue (retry/reap), forge worker status, and
+usage stats. Access code is remembered in the browser.
+
+Prefer the terminal? `BRO_BASE_URL=... BRO_ACCESS_CODE=... python -m app.cli`
+streams chat in a REPL (`/new`, `/threads`, `/thread <id>`, `/quit`).
 
 ## Guardrails
 
