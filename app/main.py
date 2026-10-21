@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
@@ -36,6 +37,7 @@ from . import dispatch as forge_dispatch
 from .context import build_window
 from .guards import check_hard_boundary
 from . import rate_limit
+from . import stats
 from .router import get_router, looks_like_refusal
 
 logging.basicConfig(level=logging.INFO)
@@ -102,6 +104,80 @@ def models(access_code: str = ""):
     _check_access(access_code)
     router = get_router()
     return {"order": router.preferred_order(), "providers": router.status()}
+
+
+@app.get("/api/stats")
+def usage_stats(access_code: str = "", days: int = 14):
+    """Per-day chat turns per provider (counts only, no message content)."""
+    _check_access(access_code)
+    return {"stats": stats.get_stats(days)}
+
+
+@app.get("/api/threads/{thread_id}/export")
+def thread_export(thread_id: str, access_code: str = ""):
+    """Download a thread as Markdown."""
+    from fastapi.responses import PlainTextResponse
+
+    _check_access(access_code)
+    if not memory.thread_exists(thread_id):
+        raise HTTPException(status_code=404, detail="thread not found")
+    msgs = memory.get_thread_messages(thread_id, limit=1000)
+    lines = [f"# bro chat export", ""]
+    for m in msgs:
+        who = "Jay" if m["role"] == "user" else "bro"
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(m["created_at"])) if m.get("created_at") else ""
+        lines.append(f"## {who}" + (f" ({ts})" if ts else ""))
+        lines.append(m["content"])
+        lines.append("")
+    return PlainTextResponse(
+        "\n".join(lines),
+        headers={"Content-Disposition": f"attachment; filename=bro-chat-{thread_id}.md"},
+    )
+
+
+@app.post("/api/train/{job_id}/retry")
+def train_retry(job_id: str, req: TrainClaimRequest):
+    """Re-queue a failed train job (attempts+1, capped)."""
+    _check_access(req.access_code)
+    if not train_jobs.retry_job(job_id):
+        raise HTTPException(status_code=404, detail="job not found, not failed, or out of attempts")
+    return {"ok": True}
+
+
+@app.post("/api/train/reap-stuck")
+def train_reap_stuck(req: TrainClaimRequest):
+    """Re-queue 'working' jobs whose worker vanished (no worker row needed)."""
+    _check_access(req.access_code)
+    return {"requeued": train_jobs.fail_stuck_jobs()}
+
+
+UPLOAD_MAX_BYTES = 50 * 1024 * 1024
+
+
+@app.post("/api/upload")
+async def upload(file: UploadFile = File(...), access_code: str = Form("")):
+    """Upload a file into the agent's workdir (workdir/uploads/)."""
+    from .sandbox import display_path, resolve, workdir
+
+    _check_access(access_code)
+    root = workdir()
+    safe_name = "".join(c if (c.isalnum() or c in "._-") else "_" for c in (file.filename or "file"))[:128]
+    safe_name = safe_name.lstrip(".") or "file"  # no hidden files, no dot-only names
+    dest = resolve(root, os.path.join("uploads", safe_name))
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    size = 0
+    with open(dest, "wb") as f:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > UPLOAD_MAX_BYTES:
+                f.close()
+                os.unlink(dest)
+                raise HTTPException(status_code=413, detail="file too large (50MB cap)")
+            f.write(chunk)
+    return {"ok": True, "path": display_path(root, dest), "bytes": size}
 
 
 @app.get("/api/threads")
@@ -212,6 +288,8 @@ async def chat(req: ChatRequest, request: Request):
                 final_error = str(e)
         if final_text:
             memory.add_message(thread_id, "assistant", final_text)
+            in_chars = sum(len(str(m.get("content", ""))) for m in messages)
+            stats.record_turn(final_source, in_chars, len(final_text))
             yield f"data: {json.dumps({'type': 'done', 'reply': final_text, 'model': final_source})}\n\n"
         else:
             err = f"Agent error: {final_error or 'all providers failed'}"

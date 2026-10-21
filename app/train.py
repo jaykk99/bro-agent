@@ -43,6 +43,10 @@ def _connect() -> sqlite3.Connection:
                 "result_url TEXT, metrics_json TEXT, error TEXT, "
                 "created_at REAL NOT NULL, updated_at REAL NOT NULL)"
             )
+            # Migration: older DBs lack the attempts column.
+            cols = {r["name"] for r in _conn.execute("PRAGMA table_info(train_jobs)").fetchall()}
+            if "attempts" not in cols:
+                _conn.execute("ALTER TABLE train_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
             _conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_train_jobs_status "
                 "ON train_jobs(status, created_at)"
@@ -151,6 +155,53 @@ def requeue_job(job_id: str) -> bool:
         )
         c.commit()
         return cur.rowcount > 0
+
+
+def retry_job(job_id: str, max_attempts: int = 3) -> bool:
+    """Retry a failed job: failed -> queued, attempts+1. Refuses when the job
+    already hit max_attempts (something is really wrong — needs Jay)."""
+    c = _connect()
+    with _lock:
+        row = c.execute(
+            "SELECT status, attempts FROM train_jobs WHERE id=?", (job_id,)
+        ).fetchone()
+        if not row or row["status"] != "failed":
+            return False
+        if (row["attempts"] or 0) >= max_attempts:
+            return False
+        c.execute(
+            "UPDATE train_jobs SET status='queued', attempts=attempts+1,"
+            " error=NULL, updated_at=? WHERE id=?",
+            (time.time(), job_id),
+        )
+        c.commit()
+        return True
+
+
+def fail_stuck_jobs(max_working_s: float = 3600) -> list[str]:
+    """Re-queue 'working' jobs whose worker vanished without completing.
+
+    The forge dispatcher reaps dead *workers*; this covers jobs stuck in
+    'working' with no worker row at all (e.g. claimed via /api/train/claim
+    directly, then the notebook died). Attempts are bumped so a poison job
+    can't spin forever — retry_job() still caps total attempts.
+    """
+    c = _connect()
+    cutoff = time.time() - max_working_s
+    with _lock:
+        stuck = c.execute(
+            "SELECT id FROM train_jobs WHERE status='working' AND updated_at < ?",
+            (cutoff,),
+        ).fetchall()
+        ids = [r["id"] for r in stuck]
+        if ids:
+            c.execute(
+                "UPDATE train_jobs SET status='queued', attempts=attempts+1,"
+                " updated_at=? WHERE status='working' AND updated_at < ?",
+                (time.time(), cutoff),
+            )
+            c.commit()
+        return ids
 
 
 def count_queued_jobs() -> int:
