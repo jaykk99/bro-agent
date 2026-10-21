@@ -95,6 +95,7 @@ async def create_bro_agent(preferred: str | None = None):
     from .tools_exec import exec_tools
     from .tools_files import file_tools
     from .tools_git import git_tools
+    from .tools_image import image_tools
     from .tools_web import web_tools
 
     order = (preferred,) if preferred else ("pollinations", "horde")
@@ -109,6 +110,7 @@ async def create_bro_agent(preferred: str | None = None):
     extra_tools.extend(file_tools())
     extra_tools.extend(exec_tools())
     extra_tools.extend(git_tools())
+    extra_tools.extend(image_tools())
 
     workdir = os.environ.get("BRO_WORKDIR", os.path.expanduser("~/bro-work"))
     os.makedirs(workdir, exist_ok=True)
