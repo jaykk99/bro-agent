@@ -63,6 +63,14 @@ def chat_stream(message: str, thread_id: str) -> tuple[str, str, str]:
                         continue
                     if evt.get("type") == "thread" and evt.get("thread_id"):
                         tid = evt["thread_id"]
+                    elif evt.get("type") == "progress":
+                        # Live status while the turn runs (provider hops).
+                        sys.stdout.write(
+                            f"\r\033[Kbro> ({evt.get('stage', '?')} {evt.get('provider', '?')}…)"
+                        )
+                        sys.stdout.flush()
+                    elif evt.get("type") == "ping":
+                        pass  # heartbeat — the turn is still alive, keep the status line
                     elif evt.get("type") == "done":
                         reply = evt.get("reply", "")
                         model = evt.get("model", "")

@@ -11,6 +11,8 @@ Endpoints:
   DELETE /api/threads/{id} — delete a thread and its messages
   GET  /api/threads/{id}/export — thread as a Markdown download
   POST /api/chat    — chat turn (SSE stream). Body: {message, thread_id?, access_code}
+                     Events: thread, progress{stage: trying|failed|refused, provider},
+                     ping (20s heartbeat), done{reply, model}, error
   POST /api/upload  — upload a file into workdir/uploads/. Form: {file, access_code}
   POST /api/train   — queue a fine-tune job. Body: {model_repo, dataset?, lora_rank?, access_code}
   GET  /api/train/list — recent training jobs (access_code query param)
@@ -58,6 +60,11 @@ STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "static")
 
 # Bound absurd inputs before they touch the model or the DB.
 MAX_MESSAGE_CHARS = 20_000
+
+# SSE heartbeat: while a provider turn blocks (Horde queue waits can run
+# minutes), emit a ping this often so the stream never goes quiet long
+# enough for a proxy to kill it — and the UI can show it's still alive.
+CHAT_HEARTBEAT_S = 20.0
 
 
 @app.middleware("http")
@@ -304,45 +311,87 @@ async def chat(req: ChatRequest, request: Request):
     async def stream():
         from .agent import create_bro_agent
 
-        yield f"data: {json.dumps({'type': 'thread', 'thread_id': thread_id})}\n\n"
-        router = get_router()
-        order = router.preferred_order()
-        messages = [{"role": m["role"], "content": m["content"]} for m in build_window(history)]
-        final_text, final_source, final_error = "", "", ""
-        # Walk the provider chain: on hard error OR refusal boilerplate from
-        # a fallback model (Jay's standing order — never show Jay a refusal
-        # on legit work), move to the next provider instead of giving up.
-        for i, provider in enumerate(order):
+        # The turn runs as a background task feeding an event queue, so the
+        # generator can emit progress events and heartbeat pings while a
+        # provider blocks (Horde queue waits can run minutes). Two wins: the
+        # UI shows live status instead of a dead "thinking…" indicator, and
+        # quiet SSE streams don't get killed by intermediate proxies.
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def run_turn() -> None:
             try:
-                agent, source = await create_bro_agent(preferred=provider)
-                # Bound the turn: a hung provider must not hang the SSE stream forever.
-                turn_timeout = float(os.environ.get("BRO_TURN_TIMEOUT_S", "600"))
-                result = await asyncio.wait_for(agent.ainvoke({"messages": messages}), timeout=turn_timeout)
-                out_messages = result["messages"] if isinstance(result, dict) else []
-                text = ""
-                if out_messages:
-                    last = out_messages[-1]
-                    text = getattr(last, "content", "") or str(last)
-                if looks_like_refusal(text) and i < len(order) - 1:
-                    logger.warning("provider %s refused legit work, skipping to next", source)
-                    router.record_failure(source)
+                await queue.put({"type": "thread", "thread_id": thread_id})
+                router = get_router()
+                order = router.preferred_order()
+                messages = [{"role": m["role"], "content": m["content"]} for m in build_window(history)]
+                final_text, final_source, final_error = "", "", ""
+                # Walk the provider chain: on hard error OR refusal boilerplate
+                # from a fallback model (Jay's standing order — never show Jay
+                # a refusal on legit work), move to the next provider instead
+                # of giving up.
+                for i, provider in enumerate(order):
+                    await queue.put({"type": "progress", "stage": "trying", "provider": provider})
+                    try:
+                        agent, source = await create_bro_agent(preferred=provider)
+                        # Bound the turn: a hung provider must not hang the stream forever.
+                        turn_timeout = float(os.environ.get("BRO_TURN_TIMEOUT_S", "600"))
+                        result = await asyncio.wait_for(
+                            agent.ainvoke({"messages": messages}), timeout=turn_timeout
+                        )
+                        out_messages = result["messages"] if isinstance(result, dict) else []
+                        text = ""
+                        if out_messages:
+                            last = out_messages[-1]
+                            text = getattr(last, "content", "") or str(last)
+                        if looks_like_refusal(text) and i < len(order) - 1:
+                            logger.warning("provider %s refused legit work, skipping to next", source)
+                            router.record_failure(source)
+                            await queue.put(
+                                {"type": "progress", "stage": "refused", "provider": source}
+                            )
+                            continue
+                        router.record_success(source)
+                        final_text, final_source = text, source
+                        break
+                    except Exception as e:
+                        logger.exception("agent turn failed on %s", provider)
+                        router.record_failure(provider)
+                        await queue.put(
+                            {
+                                "type": "progress",
+                                "stage": "failed",
+                                "provider": provider,
+                                "error": str(e)[:200],
+                            }
+                        )
+                        final_error = str(e)
+                if final_text:
+                    memory.add_message(thread_id, "assistant", final_text)
+                    in_chars = sum(len(str(m.get("content", ""))) for m in messages)
+                    stats.record_turn(final_source, in_chars, len(final_text))
+                    await queue.put({"type": "done", "reply": final_text, "model": final_source})
+                else:
+                    err = f"Agent error: {final_error or 'all providers failed'}"
+                    memory.add_message(thread_id, "assistant", err)
+                    await queue.put({"type": "error", "error": final_error or "all providers failed"})
+            except Exception as e:  # never leave the consumer hanging on pings
+                logger.exception("chat turn producer crashed")
+                await queue.put({"type": "error", "error": f"internal error: {e}"})
+
+        task = asyncio.create_task(run_turn())
+        try:
+            while True:
+                try:
+                    evt = await asyncio.wait_for(queue.get(), timeout=CHAT_HEARTBEAT_S)
+                except asyncio.TimeoutError:
+                    yield f"data: {json.dumps({'type': 'ping'})}\n\n"
                     continue
-                router.record_success(source)
-                final_text, final_source = text, source
-                break
-            except Exception as e:
-                logger.exception("agent turn failed on %s", provider)
-                router.record_failure(provider)
-                final_error = str(e)
-        if final_text:
-            memory.add_message(thread_id, "assistant", final_text)
-            in_chars = sum(len(str(m.get("content", ""))) for m in messages)
-            stats.record_turn(final_source, in_chars, len(final_text))
-            yield f"data: {json.dumps({'type': 'done', 'reply': final_text, 'model': final_source})}\n\n"
-        else:
-            err = f"Agent error: {final_error or 'all providers failed'}"
-            memory.add_message(thread_id, "assistant", err)
-            yield f"data: {json.dumps({'type': 'error', 'error': final_error or 'all providers failed'})}\n\n"
+                yield f"data: {json.dumps(evt)}\n\n"
+                if evt.get("type") in ("done", "error"):
+                    break
+        finally:
+            if not task.done():
+                task.cancel()
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 

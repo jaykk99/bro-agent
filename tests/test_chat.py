@@ -158,3 +158,43 @@ def test_chat_turn_persisted(monkeypatch):
     msgs = main_mod.memory.get_history(tid)
     assert msgs[0] == {"role": "user", "content": "remember this"}
     assert msgs[1] == {"role": "assistant", "content": "persisted!"}
+
+
+def test_chat_progress_events_announce_provider_hops(monkeypatch):
+    _fresh_router()
+    _install(
+        monkeypatch,
+        {
+            "pollinations": [("raise", RuntimeError("boom"))],
+            "horde": [("reply", "recovered")],
+        },
+    )
+    r = client.post("/api/chat", json={"message": "hi", "access_code": ""})
+    evts = _events(r)
+    stages = [(e.get("stage"), e.get("provider")) for e in evts if e["type"] == "progress"]
+    assert ("trying", "pollinations") in stages
+    assert ("failed", "pollinations") in stages
+    assert ("trying", "horde") in stages
+    done = next(e for e in evts if e["type"] == "done")
+    assert done["reply"] == "recovered"
+
+
+def test_chat_heartbeat_pings_during_slow_turn(monkeypatch):
+    import asyncio as _asyncio
+
+    _fresh_router()
+    monkeypatch.setattr(main_mod, "CHAT_HEARTBEAT_S", 0.05)
+
+    class SlowAgent:
+        async def ainvoke(self, _input):
+            await _asyncio.sleep(0.3)
+            return {"messages": [FakeMsg("slow ok")]}
+
+    async def fake_create(preferred=None):
+        return SlowAgent(), preferred
+
+    monkeypatch.setattr(agent_mod, "create_bro_agent", fake_create)
+    r = client.post("/api/chat", json={"message": "hi", "access_code": ""})
+    evts = _events(r)
+    assert any(e["type"] == "ping" for e in evts)  # stream stayed alive mid-turn
+    assert next(e for e in evts if e["type"] == "done")["reply"] == "slow ok"

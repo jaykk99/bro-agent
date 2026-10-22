@@ -456,6 +456,14 @@ async function postMessage(text) {
         try { evt = JSON.parse(line.slice(5)); } catch (e) { continue; }
         if (evt.type === "thread" && evt.thread_id) {
           if (!threadId) { threadId = evt.thread_id; loadThreads(); }
+        } else if (evt.type === "progress") {
+          // Live turn status: which provider is being tried, and failover hops.
+          const who = $("typing-who");
+          if (evt.stage === "trying") who.textContent = "bro is thinking… (trying " + evt.provider + ")";
+          else if (evt.stage === "failed") who.textContent = "bro is thinking… (" + evt.provider + " failed, trying next)";
+          else if (evt.stage === "refused") who.textContent = "bro is thinking… (" + evt.provider + " refused, trying next)";
+        } else if (evt.type === "ping") {
+          // Heartbeat — the turn is still running, nothing to render.
         } else if (evt.type === "done") {
           reply = evt.reply || ""; done = true;
         } else if (evt.type === "error") {
