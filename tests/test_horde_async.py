@@ -63,6 +63,7 @@ def _install_lc_stubs():
     class ToolMessage(BaseMessage):
         type: str = "tool"
         name: str = ""
+        tool_call_id: str = ""
 
     @dataclass
     class AIMessage(BaseMessage):
