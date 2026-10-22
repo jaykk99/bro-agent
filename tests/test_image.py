@@ -45,7 +45,9 @@ def _install(monkeypatch, status=200, ctype="image/jpeg", content=_FAKE_JPEG):
 
 def run(monkeypatch, tmp_path, **kwargs):
     monkeypatch.setenv("BRO_WORKDIR", str(tmp_path / "work"))
-    return asyncio.run(GenerateImageTool().run(**kwargs)).output
+    # The real UniHarness BaseAgentTool has no .run(); tools are invoked
+    # through __call__, which validates kwargs against args_schema.
+    return asyncio.run(GenerateImageTool()(**kwargs)).output
 
 
 def test_build_image_url():

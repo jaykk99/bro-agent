@@ -1,9 +1,11 @@
 """Tests for the Horde LLM module: tool-call parsing, prompt building, and the
 new non-blocking async generate path.
 
-langchain_core is NOT installed in this environment, so minimal stubs are
-injected into sys.modules before importing app.horde_llm. The stubs mirror
-the small slice of the langchain API the module actually uses.
+If langchain_core is importable (the normal case: it ships with uniharness),
+the real message classes are used. The minimal stubs below only get installed
+when langchain_core is genuinely missing, so the stub classes can never
+poison sys.modules and break sibling test modules that import the real
+langchain_core.messages.
 """
 
 import asyncio
@@ -16,6 +18,22 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _install_lc_stubs():
+    """Install minimal langchain_core stubs ONLY when the real package is
+    missing. Returns the messages module (real or stub) to build test
+    messages from.
+
+    Never overwrite sys.modules when langchain_core is importable: doing so
+    breaks app.horde_llm and sibling test modules that already imported the
+    real classes (stale isinstance checks, missing kwargs like
+    ToolMessage.tool_call_id).
+    """
+    try:
+        from langchain_core import messages as real_messages
+
+        return real_messages
+    except ImportError:
+        pass
+
     from pydantic import BaseModel
 
     lc = types.ModuleType("langchain_core")
@@ -130,8 +148,8 @@ def test_messages_to_prompt_replays_tool_history():
     msgs = [
         _msgs.SystemMessage(content="You are bro."),
         _msgs.HumanMessage(content="fetch it"),
-        _msgs.AIMessage(content="on it", tool_calls=[{"name": "web_fetch", "args": {"url": "http://x.example/"}}]),
-        _msgs.ToolMessage(content="page text", name="web_fetch"),
+        _msgs.AIMessage(content="on it", tool_calls=[{"name": "web_fetch", "args": {"url": "http://x.example/"}, "id": "call_1"}]),
+        _msgs.ToolMessage(content="page text", name="web_fetch", tool_call_id="call_1"),
     ]
     prompt = _messages_to_prompt(msgs, "Available tools:\n- web_fetch: fetch")
     assert "You are bro." in prompt

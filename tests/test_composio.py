@@ -56,12 +56,16 @@ def _install(handler, monkeypatch):
 def run(tool, monkeypatch, handler, key="k", **kwargs):
     monkeypatch.setenv("COMPOSIO_API_KEY", key)
     _install(handler, monkeypatch)
-    return asyncio.run(tool.run(**kwargs)).output
+    # The real UniHarness BaseAgentTool has no .run(); tools are invoked
+    # through __call__, which validates kwargs against args_schema.
+    return asyncio.run(tool(**kwargs)).output
 
 
 def test_execute_no_key(monkeypatch):
     monkeypatch.delenv("COMPOSIO_API_KEY", raising=False)
-    out = asyncio.run(ComposioExecuteTool().run(tool_slug="X", arguments={})).output
+    # The real UniHarness BaseAgentTool has no .run(); tools are invoked
+    # through __call__, which validates kwargs against args_schema.
+    out = asyncio.run(ComposioExecuteTool()(tool_slug="X", arguments={})).output
     assert "not configured" in out
 
 

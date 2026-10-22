@@ -57,3 +57,17 @@ except Exception:  # local test path — no uniharness installed
             schema = getattr(self, "args_schema", None)
             params = schema(**kwargs) if schema is not None else kwargs
             return await self.execute(params)
+
+        async def __call__(self, **kwargs: Any) -> ToolResult:
+            """Mirror the real UniHarness __call__: validate via args_schema,
+            execute, and return a ToolResult carrying the validation error
+            instead of raising (so the agent sees it as tool output)."""
+            schema = getattr(self, "args_schema", None)
+            if schema is not None:
+                try:
+                    params = schema(**kwargs)
+                except Exception as e:  # pydantic.ValidationError
+                    return ToolResult(output=f"Tool call to `{self.name}` failed: {e}")
+            else:
+                params = kwargs
+            return await self.execute(params)

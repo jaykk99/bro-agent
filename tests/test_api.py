@@ -50,21 +50,16 @@ def test_chat_rejects_empty():
 
 
 def test_chat_rate_limited():
+    # Deterministic: drain the exact bucket the endpoint checks, then one
+    # more turn must 429. The access gate is off in these tests, so the
+    # endpoint keys by client IP; Starlette's TestClient reports "testclient".
     rate_limit.reset_for_tests()
+    key = "ip:testclient"
     for _ in range(rate_limit.BURST):
-        rate_limit.check("ip:test-client")
-    # next turn through the endpoint should 429 (key is ip-based here)
-    # force the bucket empty via direct checks on the real key is awkward;
-    # instead hammer the endpoint until 429 appears.
-    got_429 = False
-    for _ in range(rate_limit.BURST + 5):
-        r = client.post("/api/chat", json={"message": "hi", "access_code": ""})
-        if r.status_code == 429:
-            got_429 = True
-            assert "Retry-After" in r.headers
-            break
-        assert r.status_code in (200, 400)
-    assert got_429
+        rate_limit.check(key)
+    r = client.post("/api/chat", json={"message": "hi", "access_code": ""})
+    assert r.status_code == 429
+    assert "Retry-After" in r.headers
 
 
 def test_access_gate_blocks_when_set(monkeypatch):

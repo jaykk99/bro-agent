@@ -31,7 +31,9 @@ def root(tmp_path, monkeypatch):
 
 
 def run(tool, **kwargs):
-    return asyncio.run(tool.run(**kwargs)).output
+    # The real UniHarness BaseAgentTool has no .run(); tools are invoked
+    # through __call__, which validates kwargs against args_schema.
+    return asyncio.run(tool(**kwargs)).output
 
 
 def test_resolve_inside(root):

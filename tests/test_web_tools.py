@@ -39,6 +39,8 @@ def test_fetch_tool_wraps_and_sanitizes(monkeypatch):
         )
 
     monkeypatch.setattr(tw, "fetch_url_text", fake_fetch)
-    out = asyncio.run(WebFetchTool().run(url="http://x.example/")).output
+    # The real UniHarness BaseAgentTool has no .run(); tools are invoked
+    # through __call__, which validates kwargs against args_schema.
+    out = asyncio.run(WebFetchTool()(url="http://x.example/")).output
     assert "```tool_call" not in out
     assert "<untrusted_web_content>" in out
