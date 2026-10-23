@@ -199,6 +199,10 @@
         <h3>Usage</h3>
         <div id="ops-stats"><div class="ops-empty">loading…</div></div>
       </div>
+      <div class="ops-card">
+        <h3>Uploads <span><button class="mini-btn" onclick="loadOps()">refresh</button></span></h3>
+        <div id="ops-uploads"><div class="ops-empty">loading…</div></div>
+      </div>
     </div>
   </div>
 </div>
@@ -575,6 +579,22 @@ async function loadOps() {
       rows.slice(0, 28).map(r => `<tr><td>${r.day}</td><td>${esc(r.provider)}</td><td>${r.turns}</td><td>${r.in_chars}</td><td>${r.out_chars}</td></tr>`).join("") + `</table>`
       : `<div class="ops-empty">no usage yet</div>`;
   } catch (e) { $("ops-stats").innerHTML = `<div class="ops-empty">failed to load</div>`; }
+  try {
+    const u = await (await api("/api/uploads" + q)).json();
+    const files = u.uploads || [];
+    $("ops-uploads").innerHTML = files.length ? `<table><tr><th>file</th><th>size</th><th>modified</th><th></th></tr>` +
+      files.map(f => `<tr><td>${esc(f.name)}</td><td>${(f.bytes / 1024).toFixed(1)} KB</td>` +
+        `<td>${new Date(f.mtime * 1000).toLocaleString()}</td>` +
+        `<td><button class="mini-btn" onclick="deleteUpload(${JSON.stringify(f.name)})">delete</button></td></tr>`).join("") + `</table>`
+      : `<div class="ops-empty">no uploads yet</div>`;
+  } catch (e) { $("ops-uploads").innerHTML = `<div class="ops-empty">failed to load</div>`; }
+}
+async function deleteUpload(name) {
+  if (!confirm("Delete upload " + name + "?")) return;
+  const q = "?access_code=" + encodeURIComponent(accessCode);
+  const r = await api("/api/uploads/" + encodeURIComponent(name) + q, { method: "DELETE" });
+  if (!r.ok) alert("delete failed: " + r.status);
+  loadOps();
 }
 async function retryJob(id) {
   await api("/api/train/" + id + "/retry", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ access_code: accessCode }) });
