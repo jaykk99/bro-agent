@@ -108,3 +108,23 @@ def thread_exists(thread_id: str) -> bool:
     c = _connect()
     row = c.execute("SELECT 1 FROM threads WHERE id = ?", (thread_id,)).fetchone()
     return row is not None
+
+
+def search_threads(query: str, limit: int = 50) -> list[dict]:
+    """Search threads by title or message content, most recent first.
+
+    Empty query falls back to the plain list (same as /api/threads).
+    """
+    q = (query or "").strip()
+    if not q:
+        return list_threads(limit)
+    like = f"%{q}%"
+    c = _connect()
+    rows = c.execute(
+        "SELECT DISTINCT t.id, t.title, t.created_at FROM threads t "
+        "LEFT JOIN messages m ON m.thread_id = t.id "
+        "WHERE t.title LIKE ? OR m.content LIKE ? "
+        "ORDER BY t.created_at DESC LIMIT ?",
+        (like, like, max(1, limit)),
+    ).fetchall()
+    return [dict(r) for r in rows]

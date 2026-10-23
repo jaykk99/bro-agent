@@ -5,7 +5,7 @@ Endpoints:
   GET  /api/health  — liveness + model source + provider status
   GET  /api/models  — provider chain status (order, health, cooldowns)
   GET  /api/stats   — per-day/per-provider usage counts (access_code query param)
-  GET  /api/threads — list threads
+  GET  /api/threads — list threads (optional ?search= to match titles/messages)
   GET  /api/threads/{id} — thread messages with timestamps
   POST /api/threads/{id}/rename — rename a thread. Body: {title, access_code}
   DELETE /api/threads/{id} — delete a thread and its messages
@@ -232,8 +232,10 @@ async def upload(file: UploadFile = File(...), access_code: str = Form("")):
 
 
 @app.get("/api/threads")
-def threads(access_code: str = ""):
+def threads(access_code: str = "", search: str = ""):
     _check_access(access_code)
+    if (search or "").strip():
+        return {"threads": memory.search_threads(search)}
     return {"threads": memory.list_threads()}
 
 
