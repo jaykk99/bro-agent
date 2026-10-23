@@ -73,13 +73,17 @@ def get_history(thread_id: str, limit: int = 60) -> list[dict]:
     return [{"role": r["role"], "content": r["content"]} for r in rows]
 
 
-def get_thread_messages(thread_id: str, limit: int = 200) -> list[dict]:
-    """Full messages for the UI, with timestamps (oldest first)."""
+def get_thread_messages(thread_id: str, limit: int = 200, offset: int = 0) -> list[dict]:
+    """Full messages for the UI, with timestamps (oldest first).
+
+    `offset` skips the oldest messages first — the UI loads page 1 of the
+    oldest messages, then advances the offset.
+    """
     c = _connect()
     rows = c.execute(
         "SELECT role, content, created_at FROM messages WHERE thread_id = ?"
-        " ORDER BY created_at ASC LIMIT ?",
-        (thread_id, limit),
+        " ORDER BY created_at ASC LIMIT ? OFFSET ?",
+        (thread_id, max(1, limit), max(0, offset)),
     ).fetchall()
     return [{"role": r["role"], "content": r["content"], "created_at": r["created_at"]} for r in rows]
 

@@ -6,7 +6,7 @@ Endpoints:
   GET  /api/models  — provider chain status (order, health, cooldowns)
   GET  /api/stats   — per-day/per-provider usage counts (access_code query param)
   GET  /api/threads — list threads (optional ?search= to match titles/messages)
-  GET  /api/threads/{id} — thread messages with timestamps
+  GET  /api/threads/{id} — thread messages with timestamps (?limit=&offset= for paging)
   POST /api/threads/{id}/rename — rename a thread. Body: {title, access_code}
   DELETE /api/threads/{id} — delete a thread and its messages
   GET  /api/threads/{id}/export — thread as a Markdown download
@@ -280,11 +280,11 @@ def threads(access_code: str = "", search: str = ""):
 
 
 @app.get("/api/threads/{thread_id}")
-def thread_messages(thread_id: str, access_code: str = ""):
+def thread_messages(thread_id: str, access_code: str = "", limit: int = 200, offset: int = 0):
     _check_access(access_code)
     if not memory.thread_exists(thread_id):
         raise HTTPException(status_code=404, detail="thread not found")
-    return {"messages": memory.get_thread_messages(thread_id)}
+    return {"messages": memory.get_thread_messages(thread_id, limit=min(max(1, limit), 1000), offset=offset)}
 
 
 class ThreadRenameRequest(BaseModel):
