@@ -7,6 +7,9 @@ Streams the reply as it arrives (SSE). Commands inside the REPL:
     /new            start a new thread
     /threads        list recent threads
     /thread <id>    switch to a thread
+    /rename <title> rename the current thread
+    /delete         delete the current thread (asks first)
+    /export [path]  download the current thread as Markdown
     /quit           exit
 """
 
@@ -32,6 +35,38 @@ def list_threads() -> list[dict]:
     r = httpx.get(f"{BASE}/api/threads", params=_q({}), timeout=20)
     r.raise_for_status()
     return r.json().get("threads", [])
+
+
+def rename_thread(thread_id: str, title: str) -> bool:
+    """Rename a thread. Returns True on success."""
+    if not thread_id or not (title or "").strip():
+        return False
+    r = httpx.post(
+        f"{BASE}/api/threads/{thread_id}/rename",
+        json={"title": title.strip()[:60], "access_code": CODE},
+        timeout=20,
+    )
+    return r.status_code == 200
+
+
+def delete_thread(thread_id: str) -> bool:
+    """Delete a thread. Returns True on success."""
+    if not thread_id:
+        return False
+    r = httpx.delete(f"{BASE}/api/threads/{thread_id}", params=_q({}), timeout=20)
+    return r.status_code == 200
+
+
+def export_thread(thread_id: str, dest: str = "") -> str:
+    """Download a thread as Markdown and save it. Returns the file path."""
+    if not thread_id:
+        raise ValueError("no thread selected")
+    r = httpx.get(f"{BASE}/api/threads/{thread_id}/export", params=_q({}), timeout=30)
+    r.raise_for_status()
+    path = dest or f"bro-chat-{thread_id[:8]}.md"
+    with open(path, "wb") as f:
+        f.write(r.content)
+    return path
 
 
 def chat_stream(message: str, thread_id: str) -> tuple[str, str, str]:
@@ -82,7 +117,7 @@ def chat_stream(message: str, thread_id: str) -> tuple[str, str, str]:
 
 
 def main() -> None:
-    print(f"bro @ {BASE} — /new, /threads, /thread <id>, /quit")
+    print(f"bro @ {BASE} — /new, /threads, /thread <id>, /rename <title>, /delete, /export [path], /quit")
     thread_id = ""
     try:
         threads = list_threads()
@@ -119,6 +154,39 @@ def main() -> None:
                 print(f"(switched to {match[0].get('title', '')[:50]})")
             else:
                 print("(no such thread)")
+            continue
+        if line.startswith("/rename"):
+            title = line[len("/rename"):].strip()
+            if not thread_id:
+                print("(no thread selected)")
+            elif not title:
+                print("usage: /rename <title>")
+            elif rename_thread(thread_id, title):
+                print(f"(renamed to {title[:60]})")
+            else:
+                print("(rename failed)")
+            continue
+        if line == "/delete":
+            if not thread_id:
+                print("(no thread selected)")
+                continue
+            sure = input("delete this thread? [y/N] ").strip().lower()
+            if sure in ("y", "yes") and delete_thread(thread_id):
+                print("(deleted)")
+                thread_id = ""
+            else:
+                print("(kept)")
+            continue
+        if line.startswith("/export"):
+            if not thread_id:
+                print("(no thread selected)")
+            else:
+                dest = line[len("/export"):].strip()
+                try:
+                    path = export_thread(thread_id, dest)
+                    print(f"(exported to {path})")
+                except Exception as e:
+                    print(f"(export failed: {e})")
             continue
         try:
             sys.stdout.write("bro> ...")
