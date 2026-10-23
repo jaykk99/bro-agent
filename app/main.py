@@ -5,8 +5,8 @@ Endpoints:
   GET  /api/health  — liveness + model source + provider status
   GET  /api/models  — provider chain status (order, health, cooldowns)
   GET  /api/stats   — per-day/per-provider usage counts (access_code query param)
-  GET  /api/threads — list threads
-  GET  /api/threads/{id} — thread messages with timestamps
+  GET  /api/threads — list threads (optional ?search= to match titles/messages)
+  GET  /api/threads/{id} — thread messages with timestamps (?limit=&offset= for paging)
   POST /api/threads/{id}/rename — rename a thread. Body: {title, access_code}
   DELETE /api/threads/{id} — delete a thread and its messages
   GET  /api/threads/{id}/export — thread as a Markdown download
@@ -14,6 +14,8 @@ Endpoints:
                      Events: thread, progress{stage: trying|failed|refused, provider},
                      ping (20s heartbeat), done{reply, model}, error
   POST /api/upload  — upload a file into workdir/uploads/. Form: {file, access_code}
+  GET  /api/uploads — list uploaded files (name, bytes, mtime)
+  DELETE /api/uploads/{name} — delete one uploaded file
   POST /api/train   — queue a fine-tune job. Body: {model_repo, dataset?, lora_rank?, access_code}
   GET  /api/train/list — recent training jobs (access_code query param)
   GET  /api/train/{id} — one training job (access_code query param)
@@ -205,6 +207,45 @@ def train_reap_stuck(req: TrainClaimRequest):
 UPLOAD_MAX_BYTES = 50 * 1024 * 1024
 
 
+def _safe_upload_name(name: str) -> str:
+    """Same sanitizer as the upload route — names the file can actually have."""
+    safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in (name or "file"))[:128]
+    return safe.lstrip(".") or "file"
+
+
+@app.get("/api/uploads")
+def uploads_list(access_code: str = ""):
+    """List files in the agent's workdir/uploads/ (name, bytes, mtime)."""
+    from .sandbox import resolve, workdir
+
+    _check_access(access_code)
+    root = workdir()
+    uploads_dir = resolve(root, "uploads")
+    items: list[dict] = []
+    if os.path.isdir(uploads_dir):
+        for entry in sorted(os.listdir(uploads_dir)):
+            path = os.path.join(uploads_dir, entry)
+            if os.path.isfile(path):
+                st = os.stat(path)
+                items.append({"name": entry, "bytes": st.st_size, "mtime": st.st_mtime})
+    return {"uploads": items}
+
+
+@app.delete("/api/uploads/{name}")
+def upload_delete(name: str, access_code: str = ""):
+    """Delete one uploaded file by name."""
+    from .sandbox import resolve, workdir
+
+    _check_access(access_code)
+    root = workdir()
+    safe_name = _safe_upload_name(name)
+    dest = resolve(root, os.path.join("uploads", safe_name))
+    if not os.path.isfile(dest):
+        raise HTTPException(status_code=404, detail="upload not found")
+    os.unlink(dest)
+    return {"ok": True, "name": safe_name}
+
+
 @app.post("/api/upload")
 async def upload(file: UploadFile = File(...), access_code: str = Form("")):
     """Upload a file into the agent's workdir (workdir/uploads/)."""
@@ -212,8 +253,7 @@ async def upload(file: UploadFile = File(...), access_code: str = Form("")):
 
     _check_access(access_code)
     root = workdir()
-    safe_name = "".join(c if (c.isalnum() or c in "._-") else "_" for c in (file.filename or "file"))[:128]
-    safe_name = safe_name.lstrip(".") or "file"  # no hidden files, no dot-only names
+    safe_name = _safe_upload_name(file.filename)
     dest = resolve(root, os.path.join("uploads", safe_name))
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     size = 0
@@ -232,17 +272,19 @@ async def upload(file: UploadFile = File(...), access_code: str = Form("")):
 
 
 @app.get("/api/threads")
-def threads(access_code: str = ""):
+def threads(access_code: str = "", search: str = ""):
     _check_access(access_code)
+    if (search or "").strip():
+        return {"threads": memory.search_threads(search)}
     return {"threads": memory.list_threads()}
 
 
 @app.get("/api/threads/{thread_id}")
-def thread_messages(thread_id: str, access_code: str = ""):
+def thread_messages(thread_id: str, access_code: str = "", limit: int = 200, offset: int = 0):
     _check_access(access_code)
     if not memory.thread_exists(thread_id):
         raise HTTPException(status_code=404, detail="thread not found")
-    return {"messages": memory.get_thread_messages(thread_id)}
+    return {"messages": memory.get_thread_messages(thread_id, limit=min(max(1, limit), 1000), offset=offset)}
 
 
 class ThreadRenameRequest(BaseModel):

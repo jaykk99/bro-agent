@@ -83,9 +83,13 @@ refusal boilerplate. See `docs/SECURITY.md` for the full security model.
 ## API
 
 Chat: `POST /api/chat` (SSE stream, 30 turns/min rate-limited).
-Threads: list / messages / rename / delete / Markdown export.
+Threads: list / messages / rename / delete / Markdown export. `GET /api/threads` takes
+`?search=` (matches titles + message content); `GET /api/threads/{id}` takes
+`?limit=&offset=` for paging history (limit clamped to 1000).
 Models: `GET /api/models` (chain health), `GET /api/stats` (usage counts).
-Uploads: `POST /api/upload` (into `workdir/uploads/`).
+Uploads: `POST /api/upload` (into `workdir/uploads/`), `GET /api/uploads` (list),
+`DELETE /api/uploads/{name}` (delete) — also shown in the ops dashboard.
+Terminal: `python -m app.cli` — `/new /threads /thread <id> /rename <title> /delete /export [path] /quit`.
 Training + forge worker endpoints: see the module docstring in `app/main.py`.
 
 ## Training pipeline
