@@ -95,7 +95,12 @@ def _alive_workers() -> list[sqlite3.Row]:
 
 
 def status_snapshot() -> dict:
-    """Dispatcher status: alive workers per platform, dead count, queue depth."""
+    """Dispatcher status: alive workers per platform, dead count, queue depth.
+
+    Also returns the per-worker list (id, platform, last heartbeat, current
+    job, alive flag) — the aggregates alone can't tell ops WHICH worker died
+    or what job it was stuck on.
+    """
     from . import train as train_jobs
 
     alive = _alive_workers()
@@ -104,11 +109,26 @@ def status_snapshot() -> dict:
         per_platform[w["platform"]] = per_platform.get(w["platform"], 0) + 1
     c = _connect()
     dead = c.execute("SELECT COUNT(*) FROM forge_workers WHERE dead=1").fetchone()[0]
+    cutoff = time.time() - HEARTBEAT_TIMEOUT_S
+    workers = [
+        {
+            "id": r["id"],
+            "platform": r["platform"],
+            "last_seen": r["last_seen"],
+            "current_job_id": r["current_job_id"] or None,
+            "alive": bool(not r["dead"] and r["last_seen"] >= cutoff),
+        }
+        for r in c.execute(
+            "SELECT id, platform, last_seen, current_job_id, dead "
+            "FROM forge_workers ORDER BY last_seen DESC"
+        ).fetchall()
+    ]
     return {
         "alive": len(alive),
         "dead": int(dead),
         "platforms": per_platform,
         "queued_jobs": train_jobs.count_queued_jobs(),
+        "workers": workers,
     }
 
 

@@ -115,7 +115,9 @@ Pull-based GPU jobs, all behind the access-code gate:
 - `POST /api/forge/workers/heartbeat` — worker heartbeat with its current
   job, if any. `POST /api/forge/workers/{id}/finished` clears it.
 - `GET /api/forge/workers` — dispatcher status: alive/dead counts,
-  alive workers per platform, queued jobs.
+  alive workers per platform, queued jobs, plus the per-worker list
+  (id, platform, last heartbeat, current job, alive flag) so ops can see
+  which worker died and what it was stuck on.
 - `POST /api/forge/dispatch/reap` — marks workers dead after 600s without
   a heartbeat (generous slack for free-tier sleeps and cold starts) and
   re-queues their stuck train jobs back to `queued` so another worker can

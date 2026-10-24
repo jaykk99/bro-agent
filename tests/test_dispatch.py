@@ -76,6 +76,22 @@ def test_reap_skips_jobs_not_working():
     assert train.get_job(jid)["status"] == "queued"
 
 
+def test_snapshot_lists_workers_with_alive_flags():
+    wid_alive = dispatch.register_worker("colab")
+    dispatch.heartbeat(wid_alive, "job-live")
+    wid_dead = dispatch.register_worker("kaggle")
+    dispatch.heartbeat(wid_dead, "job-gone")
+    _backdate_worker(wid_dead, dispatch.HEARTBEAT_TIMEOUT_S + 60)
+    dispatch.reap_dead_workers()
+    snap = dispatch.status_snapshot()
+    by_id = {w["id"]: w for w in snap["workers"]}
+    assert by_id[wid_alive]["alive"] is True
+    assert by_id[wid_alive]["current_job_id"] == "job-live"
+    assert by_id[wid_alive]["platform"] == "colab"
+    assert by_id[wid_dead]["alive"] is False
+    assert by_id[wid_dead]["current_job_id"] is None  # cleared on reap
+
+
 def test_reap_idempotent():
     wid = dispatch.register_worker("colab")
     _backdate_worker(wid, dispatch.HEARTBEAT_TIMEOUT_S + 60)
