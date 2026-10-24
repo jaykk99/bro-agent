@@ -225,7 +225,16 @@ function inlineFmt(s) {
   s = s.replace(/`([^`\n]+)`/g, "<code>$1</code>");
   s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   s = s.replace(/(^|[^*\w])\*([^*\n]+)\*/g, "$1<em>$2</em>");
-  s = s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  // esc() only escapes & < > (safe for text nodes), but $2 here lands inside
+  // an href="..." attribute — a literal " in the URL would close the
+  // attribute early and let the rest of the URL add arbitrary attributes
+  // (e.g. onmouseover=...), which is live-content XSS since chat messages
+  // can include text pulled from fetched web pages. Escape quotes too,
+  // scoped to just the attribute value so <code>/<strong>/<em> text content
+  // above is untouched.
+  s = s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, (_m, text, url) =>
+    '<a href="' + url.replace(/"/g, "&quot;").replace(/'/g, "&#39;") + '" target="_blank" rel="noopener">' + text + '</a>'
+  );
   return s;
 }
 function renderMarkdown(src) {
