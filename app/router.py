@@ -35,21 +35,30 @@ COOLDOWN_S = 5 * 60
 
 # Refusal boilerplate a fallback model may emit on legit work. Matched
 # case-insensitively against the stripped final text of a turn.
+# Audit 2026-10-24: added the phrasings the Oct 23 list missed — the
+# "sorry, but I can't" form, "can't do this/it", "won't do this",
+# "don't feel / not comfortable", and "not permitted". A miss here does
+# not block anything; it just shows Jay a refusal instead of retrying
+# the next provider, which is exactly the false-refusal path the
+# refusal-skip exists to close.
 _REFUSAL_PATTERNS = [
-    r"sorry,?\s+i\s+(can'?t|cannot|am\s+unable|’t)",
+    r"sorry,?\s+(but\s+)?i\s+(can'?t|cannot|am\s+unable|'m\s+unable|’t)",
     r"\bi(\s+am|'m)\s+unable\s+to\b",
-    r"\bi\s+cannot\s+(help|comply|assist|do\s+that|fulfill)\b",
-    r"\bi\s+can'?t\s+(help|comply|assist|do\s+that|fulfill|provide|complete|process)\b",
+    r"\bi\s+cannot\s+(help|comply|assist|do\s+(that|this|it)|fulfill)\b",
+    r"\bi\s+can'?t\s+(help|comply|assist|do\s+(that|this|it)|fulfill|provide|complete|process)\b",
     r"\bas\s+an\s+ai\b",
     r"\bi'?m\s+not\s+able\s+to\b",
     r"\bi\s+must\s+(decline|refuse)\b",
     r"\bi\s+(have\s+to|need\s+to)\s+(decline|refuse)\b",
     r"\bi\s+refuse\s+to\b",
-    r"\bi\s+(won'?t|will\s+not)\s+(help|assist|comply|do\s+that|provide|fulfill)\b",
+    r"\bi\s+(won'?t|will\s+not)\s+(help|assist|comply|do\s+(that|this|it)|provide|fulfill)\b",
     r"\bi'?m\s+not\s+allowed\s+to\b",
     r"\bnot\s+allowed\s+to\s+(help|assist|provide|comply)\b",
     r"\bi\s+apologize,?\s+but\s+i\b",
     r"\bunfortunately,?\s+i\s+(can'?t|cannot|am\s+unable|'m\s+unable)\b",
+    r"\bi\s+(don'?t\s+feel|am\s+not|'m\s+not)\s+comfortable\b",
+    r"\bnot\s+comfortable\s+(with|helping|assisting|doing)\b",
+    r"\bi\s*(am|'m)?\s*not\s+permitted\s+to\b",
 ]
 _REFUSAL_RX = re.compile("|".join(f"(?:{p})" for p in _REFUSAL_PATTERNS), re.I)
 
