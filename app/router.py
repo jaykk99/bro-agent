@@ -1,8 +1,11 @@
 """Model routing for bro-agent: ordered providers, failure cooldowns, refusal skip.
 
-Provider chain (uncensored only, never GPT/Claude/Gemini):
-  pollinations (primary, keyless, native tools) -> horde (fallback, keyless,
-  prompt-emulated tools)
+Provider chain (uncensored first, never GPT/Claude/Gemini):
+  horde (primary, keyless, genuinely uncensored workers — Stheno / Heretic /
+  Rocinante lineage, prompt-emulated tools) -> pollinations (availability
+  fallback only, keyless, native tools; its gpt-oss-20b is the more aligned
+  model in the pool, so it is tried LAST — refusal-elimination pass,
+  2026-10-23)
 
 Two behaviors:
 
@@ -24,7 +27,7 @@ import re
 import time
 from dataclasses import dataclass, field
 
-PROVIDERS = ("pollinations", "horde")
+PROVIDERS = ("horde", "pollinations")
 
 # Two consecutive failures -> 5 minute cooldown.
 FAILURE_THRESHOLD = 2
@@ -36,9 +39,17 @@ _REFUSAL_PATTERNS = [
     r"sorry,?\s+i\s+(can'?t|cannot|am\s+unable|’t)",
     r"\bi(\s+am|'m)\s+unable\s+to\b",
     r"\bi\s+cannot\s+(help|comply|assist|do\s+that|fulfill)\b",
+    r"\bi\s+can'?t\s+(help|comply|assist|do\s+that|fulfill|provide|complete|process)\b",
     r"\bas\s+an\s+ai\b",
     r"\bi'?m\s+not\s+able\s+to\b",
-    r"\bi\s+must\s+decline\b",
+    r"\bi\s+must\s+(decline|refuse)\b",
+    r"\bi\s+(have\s+to|need\s+to)\s+(decline|refuse)\b",
+    r"\bi\s+refuse\s+to\b",
+    r"\bi\s+(won'?t|will\s+not)\s+(help|assist|comply|do\s+that|provide|fulfill)\b",
+    r"\bi'?m\s+not\s+allowed\s+to\b",
+    r"\bnot\s+allowed\s+to\s+(help|assist|provide|comply)\b",
+    r"\bi\s+apologize,?\s+but\s+i\b",
+    r"\bunfortunately,?\s+i\s+(can'?t|cannot|am\s+unable|'m\s+unable)\b",
 ]
 _REFUSAL_RX = re.compile("|".join(f"(?:{p})" for p in _REFUSAL_PATTERNS), re.I)
 
@@ -51,6 +62,9 @@ def looks_like_refusal(text: str) -> bool:
     """
     head = (text or "").strip()[:400]
     if not head:
+        return False
+    # Idiom guard: "I can't help but notice..." is not a refusal.
+    if re.search(r"can'?t\s+help\s+but\b", head, re.I):
         return False
     return bool(_REFUSAL_RX.search(head))
 

@@ -129,9 +129,9 @@ def health():
     router = get_router()
     return {
         "ok": True,
-        "model": "pollinations",
-        "pollinations_primary": True,
-        "horde_fallback": True,
+        "model": "horde",
+        "horde_primary": True,
+        "pollinations_fallback": True,
         "venice_removed": True,
         "providers": router.status(),
         "composio_configured": bool(os.environ.get("COMPOSIO_API_KEY", "").strip()),
@@ -368,9 +368,10 @@ async def chat(req: ChatRequest, request: Request):
                 messages = [{"role": m["role"], "content": m["content"]} for m in build_window(history)]
                 final_text, final_source, final_error = "", "", ""
                 # Walk the provider chain: on hard error OR refusal boilerplate
-                # from a fallback model (Jay's standing order — never show Jay
-                # a refusal on legit work), move to the next provider instead
-                # of giving up.
+                # from ANY model (Jay's standing order — never show Jay a
+                # refusal on legit work while another provider is untried),
+                # move to the next provider instead of giving up. A refusal
+                # surfaces only when every provider in the chain refused.
                 for i, provider in enumerate(order):
                     await queue.put({"type": "progress", "stage": "trying", "provider": provider})
                     try:

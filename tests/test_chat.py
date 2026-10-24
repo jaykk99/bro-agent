@@ -74,13 +74,13 @@ def _fresh_router():
 
 def test_chat_success_single_provider(monkeypatch):
     _fresh_router()
-    used = _install(monkeypatch, {"pollinations": [("reply", "hello there")], "horde": []})
+    used = _install(monkeypatch, {"horde": [("reply", "hello there")], "pollinations": []})
     r = client.post("/api/chat", json={"message": "hi", "access_code": ""})
     assert r.status_code == 200
     evts = _events(r)
     done = next(e for e in evts if e["type"] == "done")
-    assert done["reply"] == "hello there" and done["model"] == "pollinations"
-    assert used == ["pollinations"]  # no failover needed
+    assert done["reply"] == "hello there" and done["model"] == "horde"
+    assert used == ["horde"]  # uncensored primary answers, no failover needed
 
 
 def test_chat_failover_on_error(monkeypatch):
@@ -88,16 +88,16 @@ def test_chat_failover_on_error(monkeypatch):
     used = _install(
         monkeypatch,
         {
-            "pollinations": [("raise", RuntimeError("pollinations down"))],
-            "horde": [("reply", "horde answer")],
+            "horde": [("raise", RuntimeError("horde down"))],
+            "pollinations": [("reply", "pollinations answer")],
         },
     )
     r = client.post("/api/chat", json={"message": "hi", "access_code": ""})
     done = next(e for e in _events(r) if e["type"] == "done")
-    assert done["reply"] == "horde answer" and done["model"] == "horde"
-    assert used == ["pollinations", "horde"]
-    # pollinations took a failure mark (1 < threshold, still healthy-first)
-    assert get_router().status()["pollinations"]["consecutive_failures"] == 1
+    assert done["reply"] == "pollinations answer" and done["model"] == "pollinations"
+    assert used == ["horde", "pollinations"]
+    # horde took a failure mark (1 < threshold, still healthy-first)
+    assert get_router().status()["horde"]["consecutive_failures"] == 1
 
 
 def test_chat_refusal_skips_to_next_provider(monkeypatch):
@@ -105,16 +105,16 @@ def test_chat_refusal_skips_to_next_provider(monkeypatch):
     used = _install(
         monkeypatch,
         {
-            "pollinations": [("reply", "Sorry, I can't help with that.")],
-            "horde": [("reply", "sure, here's the real answer")],
+            "horde": [("reply", "I can't help with that request.")],
+            "pollinations": [("reply", "sure, here's the real answer")],
         },
     )
     r = client.post("/api/chat", json={"message": "write me a script", "access_code": ""})
     done = next(e for e in _events(r) if e["type"] == "done")
     # Jay never sees the refusal — the turn transparently moved providers.
     assert done["reply"] == "sure, here's the real answer"
-    assert done["model"] == "horde"
-    assert used == ["pollinations", "horde"]
+    assert done["model"] == "pollinations"
+    assert used == ["horde", "pollinations"]
 
 
 def test_chat_refusal_on_last_provider_is_shown(monkeypatch):
@@ -122,8 +122,8 @@ def test_chat_refusal_on_last_provider_is_shown(monkeypatch):
     _install(
         monkeypatch,
         {
-            "pollinations": [("raise", RuntimeError("down"))],
-            "horde": [("reply", "Sorry, I can't help with that.")],
+            "horde": [("raise", RuntimeError("down"))],
+            "pollinations": [("reply", "Sorry, I can't help with that.")],
         },
     )
     r = client.post("/api/chat", json={"message": "write me a script", "access_code": ""})
@@ -137,8 +137,8 @@ def test_chat_all_providers_fail(monkeypatch):
     _install(
         monkeypatch,
         {
-            "pollinations": [("raise", RuntimeError("down1"))],
-            "horde": [("raise", RuntimeError("down2"))],
+            "horde": [("raise", RuntimeError("down1"))],
+            "pollinations": [("raise", RuntimeError("down2"))],
         },
     )
     r = client.post("/api/chat", json={"message": "hi", "access_code": ""})
@@ -152,7 +152,7 @@ def test_chat_all_providers_fail(monkeypatch):
 
 def test_chat_turn_persisted(monkeypatch):
     _fresh_router()
-    _install(monkeypatch, {"pollinations": [("reply", "persisted!")], "horde": []})
+    _install(monkeypatch, {"horde": [("reply", "persisted!")], "pollinations": []})
     r = client.post("/api/chat", json={"message": "remember this", "access_code": ""})
     tid = next(e for e in _events(r) if e["type"] == "thread")["thread_id"]
     msgs = main_mod.memory.get_history(tid)
@@ -165,16 +165,16 @@ def test_chat_progress_events_announce_provider_hops(monkeypatch):
     _install(
         monkeypatch,
         {
-            "pollinations": [("raise", RuntimeError("boom"))],
-            "horde": [("reply", "recovered")],
+            "horde": [("raise", RuntimeError("boom"))],
+            "pollinations": [("reply", "recovered")],
         },
     )
     r = client.post("/api/chat", json={"message": "hi", "access_code": ""})
     evts = _events(r)
     stages = [(e.get("stage"), e.get("provider")) for e in evts if e["type"] == "progress"]
-    assert ("trying", "pollinations") in stages
-    assert ("failed", "pollinations") in stages
     assert ("trying", "horde") in stages
+    assert ("failed", "horde") in stages
+    assert ("trying", "pollinations") in stages
     done = next(e for e in evts if e["type"] == "done")
     assert done["reply"] == "recovered"
 
