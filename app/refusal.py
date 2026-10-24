@@ -140,10 +140,22 @@ def _theft_wallets(t: str) -> bool:
     # Mixer branch: requires the laundering service/mechanism itself
     # (mixer/tumbler/coinjoin/laundering), not the bare verb "mix" — mixing
     # a portfolio report, tracks, or a spreadsheet is ordinary work.
-    return bool(
-        re.search(r"\b(mixer|tumbler|coinjoin|launder|laundering)\b", t)
-        and re.search(r"\b(crypto|btc|bitcoin|eth|coins?|funds)\b", t)
-    )
+    # Audit 2026-10-24: plurals (mixers/tumblers/coinjoins) used to evade
+    # this branch entirely. Discussion *about* mixers (essay, explainer,
+    # class) passes unless a laundering action verb is present — an
+    # explainer that says "hide/launder" is instructions, not discussion.
+    if re.search(
+        r"\b(mixers?|tumblers?|coinjoins?|launder|laundering)\b", t
+    ) and re.search(r"\b(crypto|btc|bitcoin|eth|coins?|funds)\b", t):
+        discussion = bool(
+            _INFO_CTX.search(t)
+            or re.search(r"\b(explain|what is|what's|how do|how does)\b", t)
+        )
+        laundering_action = bool(
+            re.search(r"\b(launder|laundering|hide|hiding|conceal|wash|obscure|anonymize)\b", t)
+        )
+        return not (discussion and not laundering_action)
+    return False
 
 
 def _unauthorized_hacking(t: str) -> bool:
@@ -184,9 +196,57 @@ def _csam(t: str) -> bool:
     if re.search(r"\b(no|not|without|non-)\s*(any\s+)?(explicit|sexual|erotic|porn)", t):
         # Explicitly negated ("no explicit content") is a cleanliness spec.
         return False
+    # Audit 2026-10-24 — the old musical-key strip was greedy: it dropped
+    # "a minor" before ANY following word ("a minor girl"), which let real
+    # sexual-content requests about a minor sail through. Only genuine
+    # musical forms are stripped now: "in <letter> minor" and
+    # "minor key/scale/chord". "A minor business owner" no longer passes
+    # via this strip (it passes via the explicit-costs collocation below).
     # "A minor" the musical key is not a person: drop that token.
-    t2 = re.sub(r"\b(in\s+)?[a-g]\s+minor\s+(key|scale|chord)?\b", " ", t)
+    t2 = re.sub(r"\bin\s+[a-g]\s+minor\b", " ", t)
     t2 = re.sub(r"\bminor\s+(key|scale|chord)\b", " ", t2)
+    # Non-sexual collocations of "explicit" — an economics term, never
+    # sexual content. Stripping the collocation leaves any genuinely
+    # sexual word (porn, sexual) still standing to trip the main match.
+    t2 = re.sub(r"\bexplicit\s+costs?\b", " ", t2)
+    _sexual = re.search(r"\b(sexual|porn|pornography|erotic)\b", t2)
+    # Protective intent: setting up filters / parental controls to BLOCK
+    # explicit content for a teen is the opposite of requesting it.
+    if (
+        re.search(r"\bexplicit\s+content\s+(filter|filters|filtering|block|blocking)\b", t2)
+        or (re.search(r"\bexplicit\s+content\b", t2) and re.search(r"\bparental\b", t2))
+    ) and not _sexual:
+        return False
+    # Music-rating discussion: "explicit lyrics" labels, ratings, and
+    # advisories are a parental-advisory term, not a content request —
+    # but only when the request is actually about labels/ratings. A bare
+    # "write explicit lyrics about a teen" has no label context and
+    # still blocks.
+    if (
+        re.search(r"\bexplicit\s+(lyrics|language)\b", t2)
+        and re.search(r"\b(label|labels|labelled|labeled|rating|rated|advisory|music)\b", t2)
+        and not _sexual
+    ):
+        return False
+    # Nude art: a nude painting/sculpture/statue in a museum, gallery,
+    # lesson, or story is art description, not sexual content — unless
+    # the minor IS the subject of the nude art ("nude painting of a
+    # teen", "teen nude painting"), which still blocks.
+    _nude_art = re.search(
+        r"\bnude\b(\s+\w+){0,2}\s+(painting|sculpture|statue|artwork|drawing|figure)\b", t2
+    )
+    if (
+        _nude_art
+        and re.search(r"\b(museum|gallery|art|history|story|lesson|class|exhibit)\b", t2)
+        and not _sexual
+        and not re.search(r"\b(minors?|teens?|children|kids?)\s+(nude|naked)\b", t2)
+        and not re.search(
+            r"\bnude\b(\s+\w+){0,2}\s+(painting|sculpture|statue|artwork|drawing|figure)"
+            r"\s+of\s+(a\s+|the\s+)?(minors?|teens?|children|kids?)\b",
+            t2,
+        )
+    ):
+        return False
     return bool(
         re.search(r"\b(child|children|minor|minors|kid|kids|teen|underage)\b", t2)
         and re.search(r"\b(sexual|porn|pornography|nude|explicit|erotic)\b", t2)

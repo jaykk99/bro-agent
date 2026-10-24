@@ -31,14 +31,23 @@ MAX_OUTPUT_CHARS = 12000
 # Catastrophic-only blocklist. This is not a nanny filter: builds, installs,
 # git, curl, and normal scripting all pass. Only patterns that destroy the
 # host, the disk, or fork-bomb the box are refused.
+# Audit 2026-10-24: power-op / mkfs words used to fire anywhere in the
+# text, so grepping for "shutdown", echoing "halt", or passing "reboot"
+# as a script argument was refused. Those two patterns now match only
+# in command position (line start, after a shell separator, after sudo,
+# or after systemctl). dd to /dev/null is a standard benchmark/test
+# sink, not a disk write, so it is excluded too. Real commands —
+# "shutdown -h now", "sudo reboot", "mkfs.ext4 /dev/sda1", "dd
+# of=/dev/sda" — still block.
+_CMD_POS = r"(?:^|[;&|]\s*|\$\(\s*|\bsudo\s+|\bsystemctl\s+)"
 _BLOCKED_PATTERNS = [
     (re.compile(r"\brm\s+-[a-z]*r[a-z]*f?\s+/(?:\s|$)"), "rm -rf /"),
     (re.compile(r"\brm\s+-[a-z]*r[a-z]*f?\s+~(?:\s|/|$)"), "rm -rf ~"),
     (re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;"), "fork bomb"),
-    (re.compile(r"\bmkfs(\.|s)?\b"), "mkfs"),
-    (re.compile(r"\bdd\s+.*\bof=/dev/"), "dd to a device"),
+    (re.compile(_CMD_POS + r"(mkfs(\.|s)?)\b", re.M), "mkfs"),
+    (re.compile(r"\bdd\s+.*\bof=/dev/(?!null\b)"), "dd to a device"),
     (re.compile(r">\s*/dev/sd[a-z]"), "raw disk write"),
-    (re.compile(r"\b(shutdown|reboot|halt|poweroff)\b"), "power operation"),
+    (re.compile(_CMD_POS + r"(shutdown|reboot|halt|poweroff)\b", re.M), "power operation"),
     (re.compile(r"\bchmod\s+-R\s+777\s+/\b"), "chmod 777 /"),
 ]
 
