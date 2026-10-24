@@ -1,12 +1,15 @@
 """Bro agent factory — UniHarness agent with uncensored models only.
 
-Model chain (NEVER an aligned model — no GPT, no Claude, no Gemini):
-  1. Pollinations (primary) — keyless, fast, OpenAI-compatible with NATIVE
-     tool calling. Model is gpt-oss-20b (open weights, no refusals on legit work).
-  2. AI Horde (fallback) — keyless, genuinely uncensored workers
+Model chain (uncensored FIRST — no GPT, no Claude, no Gemini):
+  1. AI Horde (primary) — keyless, genuinely uncensored workers
      (Stheno / Heretic / Rocinante lineage). Tool calling is emulated
      prompt-side since Horde workers don't do native function calling.
-     Slower (queue-based) but works when Pollinations is down.
+     Slower (queue-based) but it is the least-refusing model in the pool,
+     so it goes first (refusal-elimination pass, 2026-10-23).
+  2. Pollinations (availability fallback only) — keyless, fast,
+     OpenAI-compatible with NATIVE tool calling. Model is gpt-oss-20b
+     (open weights, but the more aligned of the two — tried last, and any
+     refusal it returns is skipped by the router in app/router.py).
 
 No Venice dependency. No API keys needed. No paid services.
 
@@ -23,7 +26,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 POLLINATIONS_API_URL = "https://text.pollinations.ai/openai"
-POLLINATIONS_MODEL = "openai"  # resolves to gpt-oss-20b, open weights, uncensored
+POLLINATIONS_MODEL = "openai"  # resolves to gpt-oss-20b, open weights; most aligned in pool, fallback only
 
 SYSTEM_PROMPT = """You are bro — Jay's personal AI agent. You get things done.
 
@@ -65,18 +68,18 @@ def _pollinations_model() -> Any:
     )
 
 
-def build_llm(order: tuple[str, ...] = ("pollinations", "horde")) -> tuple[Any, str]:
+def build_llm(order: tuple[str, ...] = ("horde", "pollinations")) -> tuple[Any, str]:
     """Build the chat model. Returns (model, source_label).
 
     Tries providers in `order`; first one that initializes wins. Callers
-    (via the router) pass the healthy-first order; the default keeps the
-    classic pollinations-primary, horde-fallback chain.
+    (via the router) pass the healthy-first order; the default is the
+    uncensored-first chain: horde primary, pollinations fallback.
     """
     last_error: Exception | None = None
     for name in order:
         try:
             if name == "pollinations":
-                # Keyless, fast, uncensored, native tool calling.
+                # Keyless, fast, native tool calling. Availability fallback.
                 return _pollinations_model(), "pollinations"
             if name == "horde":
                 # Keyless uncensored workers, tool calling emulated.
@@ -94,7 +97,7 @@ async def create_bro_agent(preferred: str | None = None):
     """Create the UniHarness bro agent. Call once and reuse (or per-request).
 
     `preferred` optionally forces one provider ("pollinations" or "horde");
-    otherwise the classic chain order is used.
+    otherwise the uncensored-first chain order is used.
     """
     from uniharness import ModelProfile, create_agent
     from uniharness.computer import LocalNativeComputer
@@ -106,7 +109,7 @@ async def create_bro_agent(preferred: str | None = None):
     from .tools_image import image_tools
     from .tools_web import web_tools
 
-    order = (preferred,) if preferred else ("pollinations", "horde")
+    order = (preferred,) if preferred else ("horde", "pollinations")
     llm, source = build_llm(order)
     logger.info("bro agent model source: %s", source)
 

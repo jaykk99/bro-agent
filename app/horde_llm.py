@@ -10,8 +10,8 @@ function calling, so this module emulates it the classic ReAct way:
   * _generate parses those blocks into AIMessage.tool_calls so LangGraph's
     ToolNode executes them like native tool calls.
 
-Model chain for bro-agent: Pollinations (keyless primary) -> Horde (keyless
-fallback). Never an aligned model.
+Model chain for bro-agent: Horde (keyless, uncensored primary) ->
+Pollinations (keyless availability fallback). Never an aligned model.
 """
 
 from __future__ import annotations

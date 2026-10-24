@@ -23,6 +23,22 @@ def test_refusal_boilerplate_detected():
     assert looks_like_refusal("I must decline to answer.")
 
 
+def test_expanded_refusal_phrasings_detected():
+    # Phrasings the pre-2026-10-23 detector missed (incl. the most common one).
+    assert looks_like_refusal("I can't help with that request.")
+    assert looks_like_refusal("I won't help with that.")
+    assert looks_like_refusal("I'm not allowed to provide that information.")
+    assert looks_like_refusal("I must refuse to answer.")
+    assert looks_like_refusal("I refuse to do that.")
+    assert looks_like_refusal("Unfortunately, I can't assist with that.")
+    assert looks_like_refusal("I apologize, but I cannot continue.")
+
+
+def test_idioms_are_not_refusals():
+    assert not looks_like_refusal("I can't help but notice your gutters are overflowing.")
+    assert not looks_like_refusal("I can't believe how good this turned out, here's the copy.")
+
+
 def test_legit_answers_not_refusals():
     assert not looks_like_refusal("Here's the script you asked for:\n```python\nprint(1)\n```")
     assert not looks_like_refusal("Sure, I can help — what repo?")
@@ -32,21 +48,21 @@ def test_legit_answers_not_refusals():
     assert not looks_like_refusal(long_text)
 
 
-def test_initial_order_prefers_pollinations():
+def test_initial_order_prefers_horde_uncensored_first():
     r = ModelRouter()
-    assert r.preferred_order() == ["pollinations", "horde"]
+    assert r.preferred_order() == ["horde", "pollinations"]
 
 
 def test_failures_cool_down_provider():
     r = ModelRouter()
-    r.record_failure("pollinations")
-    assert r.preferred_order() == ["pollinations", "horde"]  # 1 failure: still first
-    r.record_failure("pollinations")
-    assert r.preferred_order() == ["horde", "pollinations"]  # cooled down: last
+    r.record_failure("horde")
+    assert r.preferred_order() == ["horde", "pollinations"]  # 1 failure: still first
+    r.record_failure("horde")
+    assert r.preferred_order() == ["pollinations", "horde"]  # cooled down: last
     status = r.status()
-    assert status["pollinations"]["healthy"] is False
-    assert status["pollinations"]["consecutive_failures"] == FAILURE_THRESHOLD
-    assert 0 < status["pollinations"]["cooldown_s_remaining"] <= COOLDOWN_S
+    assert status["horde"]["healthy"] is False
+    assert status["horde"]["consecutive_failures"] == FAILURE_THRESHOLD
+    assert 0 < status["horde"]["cooldown_s_remaining"] <= COOLDOWN_S
 
 
 def test_success_resets_failures():
@@ -55,7 +71,7 @@ def test_success_resets_failures():
     r.record_failure("horde")
     assert r.preferred_order()[0] == "pollinations"
     r.record_success("horde")
-    assert r.preferred_order() == ["pollinations", "horde"]
+    assert r.preferred_order() == ["horde", "pollinations"]
     assert r.status()["horde"]["consecutive_failures"] == 0
 
 
@@ -63,4 +79,4 @@ def test_unknown_provider_ignored():
     r = ModelRouter()
     r.record_failure("gpt-5")  # no such provider — must not crash
     r.record_success("gpt-5")
-    assert r.preferred_order() == ["pollinations", "horde"]
+    assert r.preferred_order() == ["horde", "pollinations"]

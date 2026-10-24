@@ -32,7 +32,7 @@ def test_models_endpoint():
     r = client.get("/api/models")
     assert r.status_code == 200
     d = r.json()
-    assert d["order"][0] == "pollinations"
+    assert d["order"][0] == "horde"
     assert "horde_models" in d
     assert "X-Request-ID" in r.headers  # logging middleware
 
