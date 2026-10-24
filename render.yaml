@@ -5,13 +5,12 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
-      - key: VENICE_API_KEY
-        sync: false
-      - key: VENICE_MODEL
-        value: default
       - key: COMPOSIO_API_KEY
+        sync: false
+      - key: HORDE_API_KEY
         sync: false
       - key: BRO_ACCESS_CODE
         sync: false
       - key: BRO_WORKDIR
         value: /opt/render/project/src/bro-work
+    healthCheckPath: /api/health

@@ -73,7 +73,62 @@ def get_history(thread_id: str, limit: int = 60) -> list[dict]:
     return [{"role": r["role"], "content": r["content"]} for r in rows]
 
 
+def get_thread_messages(thread_id: str, limit: int = 200, offset: int = 0) -> list[dict]:
+    """Full messages for the UI, with timestamps (oldest first).
+
+    `offset` skips the oldest messages first — the UI loads page 1 of the
+    oldest messages, then advances the offset.
+    """
+    c = _connect()
+    rows = c.execute(
+        "SELECT role, content, created_at FROM messages WHERE thread_id = ?"
+        " ORDER BY created_at ASC LIMIT ? OFFSET ?",
+        (thread_id, max(1, limit), max(0, offset)),
+    ).fetchall()
+    return [{"role": r["role"], "content": r["content"], "created_at": r["created_at"]} for r in rows]
+
+
+def rename_thread(thread_id: str, title: str) -> bool:
+    title = (title or "").strip()[:60]
+    if not title:
+        return False
+    c = _connect()
+    with _lock:
+        cur = c.execute("UPDATE threads SET title=? WHERE id=?", (title, thread_id))
+        c.commit()
+        return cur.rowcount > 0
+
+
+def delete_thread(thread_id: str) -> bool:
+    c = _connect()
+    with _lock:
+        c.execute("DELETE FROM messages WHERE thread_id=?", (thread_id,))
+        cur = c.execute("DELETE FROM threads WHERE id=?", (thread_id,))
+        c.commit()
+        return cur.rowcount > 0
+
+
 def thread_exists(thread_id: str) -> bool:
     c = _connect()
     row = c.execute("SELECT 1 FROM threads WHERE id = ?", (thread_id,)).fetchone()
     return row is not None
+
+
+def search_threads(query: str, limit: int = 50) -> list[dict]:
+    """Search threads by title or message content, most recent first.
+
+    Empty query falls back to the plain list (same as /api/threads).
+    """
+    q = (query or "").strip()
+    if not q:
+        return list_threads(limit)
+    like = f"%{q}%"
+    c = _connect()
+    rows = c.execute(
+        "SELECT DISTINCT t.id, t.title, t.created_at FROM threads t "
+        "LEFT JOIN messages m ON m.thread_id = t.id "
+        "WHERE t.title LIKE ? OR m.content LIKE ? "
+        "ORDER BY t.created_at DESC LIMIT ?",
+        (like, like, max(1, limit)),
+    ).fetchall()
+    return [dict(r) for r in rows]

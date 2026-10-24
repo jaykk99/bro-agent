@@ -10,12 +10,13 @@ function calling, so this module emulates it the classic ReAct way:
   * _generate parses those blocks into AIMessage.tool_calls so LangGraph's
     ToolNode executes them like native tool calls.
 
-Model chain for bro-agent: Pollinations (keyless primary) -> Horde (keyless
-fallback). Never an aligned model.
+Model chain for bro-agent: Horde (keyless, uncensored primary) ->
+Pollinations (keyless availability fallback). Never an aligned model.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -57,6 +58,66 @@ HORDE_UNCENSORED_MODELS = [
     "koboldcpp/Gemma-4-E4B-it-Ultra-Uncensored-Heretic",
     "koboldcpp/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M",
 ]
+
+# Live model refresh: the hardcoded list above goes stale as workers come
+# and go. resolve_models() asks the Horde API which uncensored models have
+# workers online right now (cached 6h), falling back to the hardcoded list
+# when the API is unreachable.
+MODELS_CACHE_S = 6 * 3600
+_UNCENSORED_HINTS = ("stheno", "heretic", "rocinante", "uncensored")
+_models_cache: tuple[float, list[str]] | None = None
+
+
+def _fetch_live_models(http_get=None) -> list[str]:
+    """Query the Horde model list; return online uncensored model names."""
+    get = http_get or httpx.get
+    r = get(
+        "https://stablehorde.net/api/v2/status/models",
+        headers={"User-Agent": HORDE_USER_AGENT},
+        timeout=15,
+    )
+    r.raise_for_status()
+    data = r.json()
+    items = data if isinstance(data, list) else []
+    live: list[tuple[int, str]] = []
+    for it in items:
+        name = str(it.get("name", ""))
+        workers = int(it.get("count", 0) or 0)
+        if workers <= 0:
+            continue
+        lname = name.lower()
+        if any(h in lname for h in _UNCENSORED_HINTS):
+            # prefer koboldcpp-served models (text gen), then most workers
+            prio = 0 if lname.startswith("koboldcpp/") else 1
+            live.append((prio, -workers, name))
+    live.sort()
+    return [name for _, _, name in live]
+
+
+def resolve_models(configured: list[str], http_get=None) -> list[str]:
+    """Resolve which Horde models to request.
+
+    When the caller uses the default list, refresh it against the live
+    Horde API (6h cache) so jobs don't queue forever on dead models.
+    Custom lists are used as-is. Never returns empty — falls back to the
+    hardcoded list when the API fails.
+    """
+    global _models_cache
+    if configured != HORDE_UNCENSORED_MODELS:
+        return configured
+    now = time.time()
+    if _models_cache and now - _models_cache[0] < MODELS_CACHE_S:
+        return _models_cache[1]
+    try:
+        live = _fetch_live_models(http_get)
+        if live:
+            _models_cache = (now, live)
+            logger.info("horde: refreshed model list (%d live uncensored)", len(live))
+            return live
+    except Exception as e:
+        logger.warning("horde: live model refresh failed, using defaults: %s", e)
+    _models_cache = (now, HORDE_UNCENSORED_MODELS)
+    return HORDE_UNCENSORED_MODELS
 
 TOOL_CALL_FENCE_RE = re.compile(r"```tool_call\s*\n?(.*?)```", re.DOTALL)
 TOOL_CALL_JSON_RE = re.compile(r"\{[^{}]*\"name\"\s*:\s*\"([^\"]+)\"[^{}]*\}", re.DOTALL)
@@ -165,19 +226,17 @@ def _parse_tool_calls(text: str) -> tuple[str, list[dict]]:
     return clean, calls
 
 
-def _horde_generate(prompt: str, models: list[str], max_context_length: int,
-                    max_length: int, temperature: float, timeout_s: int) -> str:
-    """Submit a prompt to AI Horde and poll until done. Raises on failure.
-
-    Tries each known Horde API host in turn — some networks get 403s from
-    one host's edge (Cloudflare IP filtering) while the other works."""
-    api_key = _horde_key()
-    headers = {
+def _submit_headers(api_key: str) -> dict:
+    return {
         "apikey": api_key,
         "Content-Type": "application/json",
         "User-Agent": HORDE_USER_AGENT,
     }
-    submit_body = {
+
+
+def _submit_body(prompt: str, models: list[str], max_context_length: int,
+                 max_length: int, temperature: float) -> dict:
+    return {
         "prompt": prompt,
         "params": {
             "max_context_length": max_context_length,
@@ -186,15 +245,87 @@ def _horde_generate(prompt: str, models: list[str], max_context_length: int,
         },
         "models": models,
     }
+
+
+def _horde_generate(prompt: str, models: list[str], max_context_length: int,
+                    max_length: int, temperature: float, timeout_s: int) -> str:
+    """Submit a prompt to AI Horde and poll until done. Raises on failure.
+
+    Tries each known Horde API host in turn — some networks get 403s from
+    one host's edge (Cloudflare IP filtering) while the other works."""
+    api_key = _horde_key()
+    headers = _submit_headers(api_key)
+    body = _submit_body(prompt, models, max_context_length, max_length, temperature)
     last_error: Exception | None = None
     for api in HORDE_APIS:
         try:
-            return _horde_generate_on(api, headers, submit_body, timeout_s)
+            return _horde_generate_on(api, headers, body, timeout_s)
         except RuntimeError as e:
             logger.warning("horde: %s failed: %s", api, e)
             last_error = e
             continue
     raise RuntimeError(f"horde: all endpoints failed (last: {last_error})")
+
+
+async def _ahorde_generate(prompt: str, models: list[str], max_context_length: int,
+                           max_length: int, temperature: float, timeout_s: int) -> str:
+    """Async twin of _horde_generate — same failover, non-blocking polls.
+
+    The sync version sleeps the calling thread between polls; inside the
+    FastAPI event loop that stalls every other request for up to 240s, so
+    the agent path prefers this one.
+    """
+    api_key = _horde_key()
+    headers = _submit_headers(api_key)
+    body = _submit_body(prompt, models, max_context_length, max_length, temperature)
+    last_error: Exception | None = None
+    for api in HORDE_APIS:
+        try:
+            return await _ahorde_generate_on(api, headers, body, timeout_s)
+        except RuntimeError as e:
+            logger.warning("horde: %s failed: %s", api, e)
+            last_error = e
+            continue
+    raise RuntimeError(f"horde: all endpoints failed (last: {last_error})")
+
+
+def _parse_status_payload(s: dict) -> str | None:
+    """Returns the generation text when the job is done, else None. Raises on fault."""
+    if s.get("faulted"):
+        raise RuntimeError("horde: job faulted")
+    if s.get("done"):
+        gens = s.get("generations") or []
+        if gens and gens[0].get("text"):
+            return gens[0]["text"]
+        raise RuntimeError("horde: done but empty generation")
+    return None
+
+
+async def _ahorde_generate_on(api: str, headers: dict, submit_body: dict, timeout_s: int) -> str:
+    async with httpx.AsyncClient(timeout=30, headers={"User-Agent": HORDE_USER_AGENT}) as client:
+        sub = await client.post(f"{api}/generate/text/async", headers=headers, json=submit_body)
+        if sub.status_code == 403:
+            raise RuntimeError("horde: 403 forbidden on submit (edge blocked this network)")
+        if sub.status_code == 429:
+            raise RuntimeError("horde: rate limited on submit (429)")
+        sub.raise_for_status()
+        job_id = sub.json().get("id")
+        if not job_id:
+            raise RuntimeError("horde: no job id returned")
+
+        poll_headers = {"apikey": headers["apikey"], "User-Agent": HORDE_USER_AGENT}
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            await asyncio.sleep(4)
+            chk = await client.get(f"{api}/generate/text/status/{job_id}", headers=poll_headers)
+            if chk.status_code == 403:
+                raise RuntimeError("horde: 403 forbidden on status poll")
+            if chk.status_code != 200:
+                continue
+            text = _parse_status_payload(chk.json())
+            if text is not None:
+                return text
+    raise RuntimeError("horde: timed out waiting for generation")
 
 
 def _horde_generate_on(api: str, headers: dict, submit_body: dict, timeout_s: int) -> str:
@@ -219,13 +350,9 @@ def _horde_generate_on(api: str, headers: dict, submit_body: dict, timeout_s: in
             if chk.status_code != 200:
                 continue
             s = chk.json()
-            if s.get("faulted"):
-                raise RuntimeError("horde: job faulted")
-            if s.get("done"):
-                gens = s.get("generations") or []
-                if gens and gens[0].get("text"):
-                    return gens[0]["text"]
-                raise RuntimeError("horde: done but empty generation")
+            text = _parse_status_payload(s)
+            if text is not None:
+                return text
     raise RuntimeError("horde: timed out waiting for generation")
 
 
@@ -270,12 +397,41 @@ class HordeChatModel(BaseChatModel):
         logger.info("horde: submitting prompt (%d chars)", len(prompt))
         text = _horde_generate(
             prompt,
-            models=self.horde_models,
+            models=resolve_models(self.horde_models),
             max_context_length=self.max_context_length,
             max_length=self.max_length,
             temperature=self.temperature,
             timeout_s=self.timeout_s,
         )
+        return self._to_chat_result(text)
+
+    async def _agenerate(
+        self,
+        messages: list[BaseMessage],
+        stop: Optional[list[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        """Async twin of _generate — non-blocking Horde polling.
+
+        LangChain calls this from async chains (like the agent's ainvoke);
+        without it the sync _generate runs in a threadpool while still
+        sleeping in 4s increments — this version yields to the event loop
+        between polls so the API stays responsive mid-generation.
+        """
+        prompt = self._build_prompt(messages)
+        logger.info("horde: submitting prompt async (%d chars)", len(prompt))
+        text = await _ahorde_generate(
+            prompt,
+            models=resolve_models(self.horde_models),
+            max_context_length=self.max_context_length,
+            max_length=self.max_length,
+            temperature=self.temperature,
+            timeout_s=self.timeout_s,
+        )
+        return self._to_chat_result(text)
+
+    def _to_chat_result(self, text: str) -> ChatResult:
         clean, calls = _parse_tool_calls(text)
         tool_calls = [
             {"name": c["name"], "args": c["args"], "id": f"call_{uuid.uuid4().hex[:12]}", "type": "tool_call"}

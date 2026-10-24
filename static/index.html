@@ -5,151 +5,613 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>bro</title>
 <style>
-  * { box-sizing: border-box; }
-  body { background:#0f172a; color:#e2e8f0; font-family:system-ui,sans-serif; margin:0; height:100vh; display:flex; flex-direction:column; }
-  header { padding:14px 20px; border-bottom:1px solid #1e293b; display:flex; justify-content:space-between; align-items:center; }
-  header h1 { margin:0; font-size:18px; color:#fff; }
-  #model-badge { font-size:12px; color:#64748b; }
-  #gate { padding:40px 20px; max-width:400px; margin:0 auto; text-align:center; }
-  #gate input { width:100%; padding:12px; margin:10px 0; background:#1e293b; border:1px solid #334155; border-radius:8px; color:#e2e8f0; font-size:15px; }
+  :root {
+    --bg:#0f172a; --panel:#1e293b; --line:#334155; --txt:#e2e8f0;
+    --dim:#94a3b8; --faint:#64748b; --accent:#22d3ee; --user:#1d4ed8;
+    --danger:#f87171; --ok:#4ade80;
+  }
+  * { box-sizing:border-box; }
+  html,body { height:100%; }
+  body { background:var(--bg); color:var(--txt); font-family:system-ui,-apple-system,sans-serif;
+         margin:0; height:100dvh; display:flex; flex-direction:column; font-size:14px; }
+  header { padding:10px 16px; border-bottom:1px solid var(--line); display:flex;
+           justify-content:space-between; align-items:center; gap:10px; flex-shrink:0; }
+  header h1 { margin:0; font-size:17px; color:#fff; letter-spacing:.5px; }
+  #model-badge { font-size:11px; color:var(--faint); background:var(--panel);
+                 border:1px solid var(--line); border-radius:20px; padding:4px 10px;
+                 white-space:nowrap; }
+  #model-badge .dot { display:inline-block; width:7px; height:7px; border-radius:50%;
+                      background:var(--ok); margin-right:6px; }
+  #model-badge.degraded .dot { background:#fbbf24; }
+
+  /* access gate */
+  #gate { padding:40px 20px; max-width:380px; margin:auto; text-align:center; }
+  #gate h2 { margin:0 0 6px; font-size:20px; }
+  #gate p.hint { color:var(--faint); font-size:13px; margin:0 0 8px; }
+  #gate input { width:100%; padding:12px; margin:10px 0; background:var(--panel);
+                border:1px solid var(--line); border-radius:8px; color:var(--txt); font-size:15px; }
   #gate button { width:100%; }
-  #chat { display:none; flex:1; flex-direction:column; max-width:900px; width:100%; margin:0 auto; }
-  #msgs { flex:1; overflow-y:auto; padding:20px; display:flex; flex-direction:column; gap:12px; }
-  .msg { padding:12px 16px; border-radius:12px; max-width:85%; white-space:pre-wrap; word-break:break-word; font-size:14px; line-height:1.5; }
-  .user { background:#1d4ed8; color:#fff; align-self:flex-end; }
-  .assistant { background:#1e293b; color:#e2e8f0; align-self:flex-start; }
-  .sys { color:#64748b; font-size:12px; align-self:center; }
-  #composer { display:flex; gap:10px; padding:16px 20px; border-top:1px solid #1e293b; }
-  #input { flex:1; background:#1e293b; border:1px solid #334155; border-radius:8px; color:#e2e8f0; padding:12px; font-size:15px; resize:none; font-family:inherit; }
-  button { background:#22d3ee; color:#0b1220; border:0; border-radius:8px; padding:12px 24px; font-size:15px; font-weight:700; cursor:pointer; }
-  button:disabled { opacity:.5; }
-  #threads { display:flex; gap:8px; padding:10px 20px; overflow-x:auto; border-bottom:1px solid #1e293b; }
-  #threads button { background:#1e293b; color:#94a3b8; padding:6px 12px; font-size:12px; font-weight:400; white-space:nowrap; }
-  #threads button.active { color:#22d3ee; border:1px solid #22d3ee; }
+  #gate-err { color:var(--danger); min-height:20px; font-size:13px; }
+
+  /* layout */
+  #app { display:none; flex:1; min-height:0; }
+  #app.open { display:flex; }
+  #sidebar { width:250px; border-right:1px solid var(--line); display:flex;
+             flex-direction:column; flex-shrink:0; background:#0c1425; }
+  #sidebar .side-head { padding:12px; border-bottom:1px solid var(--line); }
+  #new-thread { width:100%; }
+  #thread-search { width:100%; margin-top:8px; padding:8px 10px; border-radius:8px;
+                   border:1px solid var(--line); background:#0a1220; color:var(--txt);
+                   font-size:13px; outline:none; }
+  #thread-search:focus { border-color:var(--accent); }
+  #thread-list { flex:1; overflow-y:auto; padding:8px; display:flex; flex-direction:column; gap:4px; }
+  .thread-item { display:flex; align-items:center; gap:6px; padding:8px 10px; border-radius:8px;
+                 cursor:pointer; font-size:13px; color:var(--dim); border:1px solid transparent; }
+  .thread-item:hover { background:var(--panel); color:var(--txt); }
+  .thread-item.active { color:var(--accent); border-color:var(--accent); background:#0e2233; }
+  .thread-item .t-title { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .thread-item .t-act { opacity:0; background:none; border:0; color:var(--faint);
+                       padding:2px 5px; font-size:12px; cursor:pointer; }
+  .thread-item:hover .t-act { opacity:1; }
+  .thread-item .t-act:hover { color:var(--danger); }
+  #main { flex:1; display:flex; flex-direction:column; min-width:0; }
+  #msgs { flex:1; overflow-y:auto; padding:20px; display:flex; flex-direction:column; gap:14px;
+          max-width:900px; width:100%; margin:0 auto; }
+
+  /* messages */
+  .msg { max-width:88%; border-radius:12px; padding:10px 14px; word-break:break-word;
+         position:relative; }
+  .msg.user { background:var(--user); color:#fff; align-self:flex-end; white-space:pre-wrap; }
+  .msg.assistant { background:var(--panel); align-self:flex-start; width:fit-content; max-width:92%; }
+  .msg .meta { font-size:10px; color:var(--faint); margin-top:6px; display:flex; gap:8px; align-items:center; }
+  .msg .copy-btn { background:none; border:0; color:var(--faint); cursor:pointer; font-size:11px; padding:0; }
+  .msg .copy-btn:hover { color:var(--accent); }
+  .msg.error { border:1px solid var(--danger); }
+  .msg .retry-btn { margin-top:8px; background:var(--panel); border:1px solid var(--line);
+                    color:var(--txt); border-radius:6px; padding:6px 12px; cursor:pointer; font-size:12px; }
+  .msg .retry-btn:hover { border-color:var(--accent); color:var(--accent); }
+
+  /* markdown-lite */
+  .md h1,.md h2,.md h3 { margin:.6em 0 .3em; color:#fff; }
+  .md h1 { font-size:1.25em; } .md h2 { font-size:1.12em; } .md h3 { font-size:1.02em; }
+  .md p { margin:.45em 0; line-height:1.55; }
+  .md ul,.md ol { margin:.4em 0; padding-left:1.6em; }
+  .md li { margin:.2em 0; line-height:1.5; }
+  .md code { background:#0b1220; border:1px solid var(--line); border-radius:4px;
+             padding:1px 5px; font-size:.88em; font-family:ui-monospace,Menlo,monospace; }
+  .md pre { background:#0b1220; border:1px solid var(--line); border-radius:8px;
+            padding:10px 12px; overflow-x:auto; margin:.5em 0; position:relative; }
+  .md pre code { background:none; border:0; padding:0; display:block; white-space:pre; }
+  .md pre .copy-code { position:absolute; top:6px; right:6px; background:var(--panel);
+                      border:1px solid var(--line); color:var(--dim); border-radius:5px;
+                      font-size:11px; padding:3px 8px; cursor:pointer; }
+  .md pre .copy-code:hover { color:var(--accent); border-color:var(--accent); }
+  .md a { color:var(--accent); }
+  .md blockquote { border-left:3px solid var(--accent); margin:.5em 0; padding:.2em .8em; color:var(--dim); }
+
+  /* typing indicator */
+  #typing { display:none; align-self:flex-start; background:var(--panel); border-radius:12px;
+            padding:12px 18px; color:var(--faint); font-size:13px; }
+  #typing.on { display:block; }
+  #typing .dots span { display:inline-block; width:6px; height:6px; border-radius:50%;
+                      background:var(--faint); margin-right:4px; animation:blink 1.2s infinite; }
+  #typing .dots span:nth-child(2) { animation-delay:.2s; }
+  #typing .dots span:nth-child(3) { animation-delay:.4s; }
+  @keyframes blink { 0%,100%{opacity:.25} 50%{opacity:1} }
+
+  /* composer */
+  #composer { border-top:1px solid var(--line); padding:12px 16px; flex-shrink:0; }
+  #composer-inner { max-width:900px; margin:0 auto; display:flex; gap:10px; align-items:flex-end; }
+  #input { flex:1; background:var(--panel); border:1px solid var(--line); border-radius:10px;
+           color:var(--txt); padding:11px 13px; font-size:14px; font-family:inherit;
+           resize:none; max-height:160px; line-height:1.45; }
+  #input:focus { outline:none; border-color:var(--accent); }
+  #send-row { display:flex; flex-direction:column; gap:6px; align-items:stretch; }
+  button.primary { background:var(--accent); color:#0b1220; border:0; border-radius:8px;
+                   padding:11px 22px; font-size:14px; font-weight:600; cursor:pointer; }
+  button.primary:disabled { opacity:.45; cursor:default; }
+  #char-count { font-size:10px; color:var(--faint); text-align:right; }
+  #composer .hint { max-width:900px; margin:6px auto 0; font-size:11px; color:var(--faint); }
+
+  #side-toggle { display:none; background:none; border:1px solid var(--line); color:var(--dim);
+                 border-radius:6px; padding:6px 10px; font-size:13px; cursor:pointer; }
+
+  /* ops dashboard */
+  #ops { display:none; flex:1; overflow-y:auto; padding:20px; }
+  #ops.open { display:block; }
+  #ops-inner { max-width:900px; margin:0 auto; display:flex; flex-direction:column; gap:16px; }
+  .ops-card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .ops-card h3 { margin:0 0 10px; font-size:14px; color:#fff; display:flex; justify-content:space-between; align-items:center; }
+  .ops-card table { width:100%; border-collapse:collapse; font-size:12px; }
+  .ops-card th { text-align:left; color:var(--faint); font-weight:500; padding:6px 8px; border-bottom:1px solid var(--line); }
+  .ops-card td { padding:6px 8px; border-bottom:1px solid #263449; color:var(--dim); }
+  .ops-card td:first-child { color:var(--txt); font-family:ui-monospace,Menlo,monospace; font-size:11px; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; }
+  .pill.queued { background:#1e3a5f; color:#7dd3fc; }
+  .pill.working { background:#4a3a12; color:#fbbf24; }
+  .pill.done { background:#123f2a; color:#4ade80; }
+  .pill.failed { background:#4a1d1d; color:#f87171; }
+  .mini-btn { background:none; border:1px solid var(--line); color:var(--dim); border-radius:5px;
+              font-size:11px; padding:3px 9px; cursor:pointer; }
+  .mini-btn:hover { color:var(--accent); border-color:var(--accent); }
+  .ops-empty { color:var(--faint); font-size:12px; padding:8px 0; }
+
+  @media (max-width:720px) {
+    #sidebar { position:absolute; z-index:10; height:100%; left:0; top:0; bottom:0;
+               transform:translateX(-100%); transition:transform .2s; }
+    #sidebar.open { transform:none; box-shadow:0 0 40px #000; }
+    #side-toggle { display:block; }
+    .msg { max-width:94%; }
+    #msgs { padding:12px; }
+  }
 </style>
 </head>
 <body>
 <header>
-  <h1>bro</h1>
-  <span id="model-badge">…</span>
+  <div style="display:flex;gap:10px;align-items:center">
+    <button id="side-toggle" onclick="document.getElementById('sidebar').classList.toggle('open')">☰</button>
+    <h1>bro</h1>
+    <button id="view-toggle" onclick="toggleOps()" style="display:none;background:none;border:1px solid var(--line);color:var(--dim);border-radius:6px;padding:6px 10px;font-size:12px;cursor:pointer">ops</button>
+  </div>
+  <span id="model-badge"><span class="dot"></span><span id="model-name">connecting…</span></span>
 </header>
 
 <div id="gate">
   <h2>Access code</h2>
+  <p class="hint">Jay's personal agent. Enter the code to unlock.</p>
   <input type="password" id="code" placeholder="access code" autocomplete="off">
-  <button onclick="unlock()">Go</button>
-  <p id="gate-err" style="color:#f87171"></p>
+  <button class="primary" onclick="unlock()">Go</button>
+  <p id="gate-err"></p>
 </div>
 
-<div id="chat">
-  <div id="threads"></div>
-  <div id="msgs"></div>
-  <div id="composer">
-    <textarea id="input" rows="2" placeholder="Ask anything…"></textarea>
-    <button id="send" onclick="send()">Send</button>
+<div id="app">
+  <div id="sidebar">
+    <div class="side-head"><button id="new-thread" class="primary" onclick="newThread()">+ New chat</button>
+    <input id="thread-search" type="search" placeholder="Search chats…" autocomplete="off" oninput="onSearchThreads(this.value)"></div>
+    <div id="thread-list"></div>
+  </div>
+  <div id="main">
+    <div id="msgs"></div>
+    <div id="typing"><span class="dots"><span></span><span></span><span></span></span> <span id="typing-who">bro is thinking…</span></div>
+    <div id="composer">
+      <div id="composer-inner">
+        <textarea id="input" rows="2" placeholder="Ask anything…"></textarea>
+        <div id="send-row">
+          <button id="send" class="primary" onclick="send()">Send</button>
+          <span id="char-count"></span>
+        </div>
+        <label id="upload-btn" title="attach a file" style="cursor:pointer;font-size:18px;color:var(--faint);padding:8px;">📎<input type="file" id="file-input" style="display:none"></label>
+      </div>
+      <div class="hint">Enter to send · Shift+Enter for a new line</div>
+    </div>
+  </div>
+  <div id="ops">
+    <div id="ops-inner">
+      <div class="ops-card">
+        <h3>Train jobs <span><button class="mini-btn" onclick="reapStuck()">reap stuck</button> <button class="mini-btn" onclick="loadOps()">refresh</button></span></h3>
+        <div id="ops-jobs"><div class="ops-empty">loading…</div></div>
+      </div>
+      <div class="ops-card">
+        <h3>Forge workers <span><button class="mini-btn" onclick="reapWorkers()">reap dead</button></span></h3>
+        <div id="ops-workers"><div class="ops-empty">loading…</div></div>
+      </div>
+      <div class="ops-card">
+        <h3>Usage</h3>
+        <div id="ops-stats"><div class="ops-empty">loading…</div></div>
+      </div>
+      <div class="ops-card">
+        <h3>Uploads <span><button class="mini-btn" onclick="loadOps()">refresh</button></span></h3>
+        <div id="ops-uploads"><div class="ops-empty">loading…</div></div>
+      </div>
+    </div>
   </div>
 </div>
 
 <script>
-let accessCode = sessionStorage.getItem('bro_code') || '';
-let threadId = '';
-let needGate = true;
+"use strict";
+const $ = id => document.getElementById(id);
+let accessCode = localStorage.getItem("bro_code") || "";
+let threadId = "";
+let threads = [];
+let sending = false;
+let lastUserMessage = "";
 
-async function health() {
-  const r = await fetch('/api/health');
-  const h = await r.json();
-  document.getElementById('model-badge').textContent = 'model: ' + h.model + (h.venice_configured ? '' : ' (add VENICE_API_KEY for Venice)');
-  needGate = h.access_gate;
-  if (!needGate) { enter(); }
-  else if (accessCode) { enter(); }
+/* ---------- markdown-lite (no dependency, XSS-safe via escaping) ---------- */
+function esc(s) {
+  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+function inlineFmt(s) {
+  // s is already escaped; apply inline markdown
+  s = s.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/(^|[^*\w])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+  s = s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return s;
+}
+function renderMarkdown(src) {
+  const out = [];
+  const lines = esc(src).split("\n");
+  let inCode = false, codeBuf = [], inList = false, para = [];
+  const flushPara = () => { if (para.length) { out.push("<p>" + para.map(inlineFmt).join("<br>") + "</p>"); para = []; } };
+  const flushList = () => { if (inList) { out.push("</ul>"); inList = false; } };
+  for (const line of lines) {
+    const codeFence = line.match(/^```(\w*)/);
+    if (codeFence) {
+      if (inCode) { out.push('<pre><button class="copy-code" onclick="copyCode(this)">copy</button><code>' + codeBuf.join("\n") + "</code></pre>"); codeBuf = []; inCode = false; }
+      else { flushPara(); flushList(); inCode = true; }
+      continue;
+    }
+    if (inCode) { codeBuf.push(line); continue; }
+    const h = line.match(/^(#{1,3})\s+(.*)/);
+    if (h) { flushPara(); flushList(); out.push(`<h${h[1].length}>${inlineFmt(h[2])}</h${h[1].length}>`); continue; }
+    const li = line.match(/^[-*]\s+(.*)/);
+    if (li) { flushPara(); if (!inList) { out.push("<ul>"); inList = true; } out.push("<li>" + inlineFmt(li[1]) + "</li>"); continue; }
+    const ol = line.match(/^\d+[.)]\s+(.*)/);
+    if (ol) { flushPara(); flushList(); out.push("<p>" + inlineFmt(line) + "</p>"); continue; }
+    const bq = line.match(/^&gt;\s?(.*)/);
+    if (bq) { flushPara(); flushList(); out.push("<blockquote>" + inlineFmt(bq[1]) + "</blockquote>"); continue; }
+    if (!line.trim()) { flushPara(); flushList(); continue; }
+    flushList(); para.push(line);
+  }
+  flushPara(); flushList();
+  if (inCode) out.push("<pre><code>" + codeBuf.join("\n") + "</code></pre>");
+  return out.join("\n") || "<p></p>";
+}
+function copyCode(btn) {
+  const code = btn.parentElement.querySelector("code").innerText;
+  navigator.clipboard.writeText(code).then(() => { btn.textContent = "copied"; setTimeout(() => btn.textContent = "copy", 1200); });
+}
+function copyMsg(btn) {
+  const raw = btn.closest(".msg").dataset.raw || "";
+  navigator.clipboard.writeText(raw).then(() => { btn.textContent = "copied ✓"; setTimeout(() => btn.textContent = "copy", 1200); });
 }
 
-function unlock() {
-  accessCode = document.getElementById('code').value;
-  sessionStorage.setItem('bro_code', accessCode);
-  enter();
+/* ---------- api ---------- */
+async function api(path, opts = {}) {
+  const r = await fetch(path, opts);
+  if (r.status === 401) { lock(); throw new Error("wrong access code"); }
+  return r;
 }
-
-function enter() {
-  document.getElementById('gate').style.display = 'none';
-  document.getElementById('chat').style.display = 'flex';
-  loadThreads();
+function lock() {
+  $("app").classList.remove("open");
+  $("gate").style.display = "block";
+  accessCode = ""; localStorage.removeItem("bro_code");
+  $("gate-err").textContent = "session expired — enter the code again";
 }
-
-async function loadThreads() {
-  const r = await fetch('/api/threads?access_code=' + encodeURIComponent(accessCode));
-  if (r.status === 401) { document.getElementById('gate-err').textContent = 'wrong code'; back_to_gate(); return; }
-  const d = await r.json();
-  const el = document.getElementById('threads');
-  el.innerHTML = '<button onclick="newThread()">+ new</button>';
-  d.threads.forEach(t => {
-    const b = document.createElement('button');
-    b.textContent = (t.title || 'chat').slice(0, 28);
-    b.onclick = () => { threadId = t.id; document.getElementById('msgs').innerHTML = ''; markActive(b); };
-    el.appendChild(b);
-  });
-}
-function markActive(b) { document.querySelectorAll('#threads button').forEach(x => x.classList.remove('active')); b.classList.add('active'); }
-function back_to_gate() { document.getElementById('gate').style.display = 'block'; document.getElementById('chat').style.display = 'none'; }
-function newThread() { threadId = ''; document.getElementById('msgs').innerHTML = ''; }
-
-function addMsg(role, text) {
-  const d = document.createElement('div');
-  d.className = 'msg ' + role;
-  d.textContent = text;
-  document.getElementById('msgs').appendChild(d);
-  d.scrollIntoView();
-}
-
-async function send() {
-  const inp = document.getElementById('input');
-  const text = inp.value.trim();
-  if (!text) return;
-  inp.value = '';
-  document.getElementById('send').disabled = true;
-  addMsg('user', text);
-  const thinking = document.createElement('div');
-  thinking.className = 'msg sys';
-  thinking.textContent = 'working…';
-  document.getElementById('msgs').appendChild(thinking);
-
+async function unlock() {
+  const code = $("code").value.trim() || accessCode;
+  if (!code) { $("gate-err").textContent = "enter the access code"; return; }
+  $("gate-err").textContent = "";
   try {
-    const r = await fetch('/api/chat', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({message: text, thread_id: threadId, access_code: accessCode})
+    const r = await fetch("/api/threads?access_code=" + encodeURIComponent(code));
+    if (r.status === 401) { $("gate-err").textContent = "wrong code"; return; }
+    if (!r.ok) { $("gate-err").textContent = "server error " + r.status; return; }
+    accessCode = code;
+    localStorage.setItem("bro_code", code);
+    $("gate").style.display = "none";
+    $("app").classList.add("open");
+    $("view-toggle").style.display = "block";
+    await refreshModels();
+    await loadThreads();
+    if (!threadId) newThread(true);
+  } catch (e) { $("gate-err").textContent = "couldn't reach the server"; }
+}
+async function refreshModels() {
+  try {
+    const r = await api("/api/models?access_code=" + encodeURIComponent(accessCode));
+    const d = await r.json();
+    const order = d.order || [];
+    const st = d.providers || {};
+    $("model-name").textContent = order.join(" → ");
+    const degraded = order.some(p => st[p] && !st[p].healthy);
+    $("model-badge").classList.toggle("degraded", degraded);
+    $("typing-who").textContent = "bro is thinking… (" + (order[0] || "?") + ")";
+  } catch (e) { $("model-name").textContent = "offline"; }
+}
+
+/* ---------- threads ---------- */
+let _searchTimer = null;
+function onSearchThreads(q) {
+  clearTimeout(_searchTimer);
+  _searchTimer = setTimeout(async () => {
+    try {
+      const qs = "/api/threads?access_code=" + encodeURIComponent(accessCode)
+        + (q.trim() ? "&search=" + encodeURIComponent(q.trim()) : "");
+      const r = await api(qs);
+      const d = await r.json();
+      threads = d.threads || [];
+      renderThreadList();
+    } catch (e) { /* keep the old list on error */ }
+  }, 250);
+}
+async function loadThreads() {
+  try {
+    const r = await api("/api/threads?access_code=" + encodeURIComponent(accessCode));
+    const d = await r.json();
+    threads = d.threads || [];
+    renderThreadList();
+  } catch (e) { /* keep going with empty list */ }
+}
+function renderThreadList() {
+  const el = $("thread-list");
+  el.innerHTML = "";
+  for (const t of threads) {
+    const div = document.createElement("div");
+    div.className = "thread-item" + (t.id === threadId ? " active" : "");
+    const title = document.createElement("span");
+    title.className = "t-title";
+    title.textContent = t.title || "chat";
+    title.title = t.title || "chat";
+    title.ondblclick = ev => { ev.stopPropagation(); renameThread(t); };
+    const del = document.createElement("button");
+    del.className = "t-act"; del.textContent = "✕"; del.title = "delete thread";
+    del.onclick = ev => { ev.stopPropagation(); deleteThread(t.id); };
+    div.append(title, del);
+    div.onclick = () => switchThread(t.id);
+    el.appendChild(div);
+  }
+}
+function renameThread(t) {
+  const name = prompt("Rename chat:", t.title || "");
+  if (name === null) return;
+  const clean = name.trim().slice(0, 60) || t.title;
+  fetch("/api/threads/" + t.id + "/rename?access_code=" + encodeURIComponent(accessCode), {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ title: clean }),
+  }).then(r => { if (r.ok) { t.title = clean; renderThreadList(); } });
+}
+async function deleteThread(id) {
+  if (!confirm("Delete this chat?")) return;
+  const r = await api("/api/threads/" + id + "?access_code=" + encodeURIComponent(accessCode), { method: "DELETE" });
+  if (r.ok) {
+    threads = threads.filter(t => t.id !== id);
+    if (threadId === id) { threadId = ""; $("msgs").innerHTML = ""; }
+    renderThreadList();
+  }
+}
+function switchThread(id) {
+  threadId = id;
+  $("msgs").innerHTML = "";
+  $("sidebar").classList.remove("open");
+  renderThreadList();
+  loadHistory();
+}
+async function loadHistory() {
+  if (!threadId) return;
+  try {
+    const r = await api("/api/threads/" + threadId + "?access_code=" + encodeURIComponent(accessCode));
+    if (!r.ok) return;
+    const d = await r.json();
+    for (const m of d.messages || []) addMsg(m.role, m.content, m.created_at, false);
+    scrollBottom();
+  } catch (e) {}
+}
+function newThread(silent) {
+  threadId = "";
+  $("msgs").innerHTML = "";
+  $("sidebar").classList.remove("open");
+  if (!silent) $("input").focus();
+}
+
+/* ---------- messages ---------- */
+function fmtTime(ts) {
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  return d.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+function scrollBottom() { const m = $("msgs"); m.scrollTop = m.scrollHeight; }
+function addMsg(role, content, ts, animate = true) {
+  const div = document.createElement("div");
+  div.className = "msg " + (role === "user" ? "user" : "assistant");
+  div.dataset.raw = content;
+  const body = document.createElement("div");
+  if (role === "user") body.textContent = content;
+  else { body.className = "md"; body.innerHTML = renderMarkdown(content); }
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const t = document.createElement("span"); t.textContent = fmtTime(ts);
+  const copy = document.createElement("button");
+  copy.className = "copy-btn"; copy.textContent = "copy"; copy.onclick = () => copyMsg(copy);
+  meta.append(t, copy);
+  div.append(body, meta);
+  $("msgs").appendChild(div);
+  if (animate) scrollBottom();
+  return div;
+}
+function addError(text, showRetry) {
+  const div = document.createElement("div");
+  div.className = "msg assistant error";
+  div.dataset.raw = text;
+  const body = document.createElement("div");
+  body.textContent = text;
+  div.appendChild(body);
+  if (showRetry) {
+    const btn = document.createElement("button");
+    btn.className = "retry-btn"; btn.textContent = "↻ retry";
+    btn.onclick = () => { div.remove(); resend(); };
+    div.appendChild(btn);
+  }
+  $("msgs").appendChild(div);
+  scrollBottom();
+}
+
+/* ---------- sending ---------- */
+function setSending(on) {
+  sending = on;
+  $("send").disabled = on;
+  $("typing").classList.toggle("on", on);
+  if (on) scrollBottom();
+}
+async function send() {
+  const text = $("input").value.trim();
+  if (!text || sending) return;
+  lastUserMessage = text;
+  $("input").value = "";
+  autoGrow(); updateCount();
+  await postMessage(text);
+}
+function resend() { if (lastUserMessage && !sending) postMessage(lastUserMessage); }
+async function postMessage(text) {
+  addMsg("user", text, Date.now() / 1000);
+  setSending(true);
+  try {
+    const r = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text, thread_id: threadId, access_code: accessCode }),
     });
-    if (!r.ok) { thinking.textContent = 'error ' + r.status; return; }
+    if (r.status === 429) { addError("slow down a sec — rate limited, try again shortly", true); return; }
+    if (r.status === 401) { lock(); return; }
+    if (!r.ok) { addError("server error " + r.status, true); return; }
     const reader = r.body.getReader();
     const dec = new TextDecoder();
-    let buf = '';
+    let buf = "", reply = "", done = false;
     while (true) {
-      const {done, value} = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, {stream: true});
-      const parts = buf.split('\n\n');
+      const { value, done: d } = await reader.read();
+      if (d) break;
+      buf += dec.decode(value, { stream: true });
+      const parts = buf.split("\n\n");
       buf = parts.pop();
-      for (const p of parts) {
-        if (!p.startsWith('data: ')) continue;
-        const ev = JSON.parse(p.slice(6));
-        if (ev.type === 'thread') threadId = ev.thread_id;
-        if (ev.type === 'done') { thinking.remove(); addMsg('assistant', ev.reply); }
-        if (ev.type === 'error') { thinking.textContent = 'error: ' + ev.error; }
+      for (const part of parts) {
+        const line = part.trim();
+        if (!line.startsWith("data:")) continue;
+        let evt;
+        try { evt = JSON.parse(line.slice(5)); } catch (e) { continue; }
+        if (evt.type === "thread" && evt.thread_id) {
+          if (!threadId) { threadId = evt.thread_id; loadThreads(); }
+        } else if (evt.type === "progress") {
+          // Live turn status: which provider is being tried, and failover hops.
+          const who = $("typing-who");
+          if (evt.stage === "trying") who.textContent = "bro is thinking… (trying " + evt.provider + ")";
+          else if (evt.stage === "failed") who.textContent = "bro is thinking… (" + evt.provider + " failed, trying next)";
+          else if (evt.stage === "refused") who.textContent = "bro is thinking… (" + evt.provider + " refused, trying next)";
+        } else if (evt.type === "ping") {
+          // Heartbeat — the turn is still running, nothing to render.
+        } else if (evt.type === "done") {
+          reply = evt.reply || ""; done = true;
+        } else if (evt.type === "error") {
+          addError("agent error: " + (evt.error || "unknown"), true);
+          return;
+        }
       }
     }
+    if (done || reply) {
+      addMsg("assistant", reply, Date.now() / 1000);
+      refreshModels(); // provider health may have changed after failover
+    } else {
+      addError("empty reply from server", true);
+    }
   } catch (e) {
-    thinking.textContent = 'error: ' + e.message;
+    addError("connection failed: " + e.message, true);
+  } finally {
+    setSending(false);
   }
-  document.getElementById('send').disabled = false;
 }
 
-document.getElementById('input').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+/* ---------- composer niceties ---------- */
+const input = $("input");
+function autoGrow() {
+  input.style.height = "auto";
+  input.style.height = Math.min(input.scrollHeight, 160) + "px";
+}
+function updateCount() {
+  const n = input.value.length;
+  $("char-count").textContent = n ? n.toLocaleString() + " chars" : "";
+}
+input.addEventListener("input", () => { autoGrow(); updateCount(); });
+input.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
-document.getElementById('code').addEventListener('keydown', e => {
-  if (e.key === 'Enter') unlock();
+$("code").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); unlock(); } });
+$("file-input").addEventListener("change", async ev => {
+  const f = ev.target.files[0];
+  if (!f) return;
+  ev.target.value = "";
+  const fd = new FormData();
+  fd.append("file", f);
+  fd.append("access_code", accessCode);
+  try {
+    const r = await api("/api/upload", { method: "POST", body: fd });
+    const d = await r.json();
+    if (r.ok) {
+      $("input").value += ( $("input").value ? "\n" : "" ) + "[attached: " + d.path + "]";
+      autoGrow(); updateCount(); $("input").focus();
+    } else {
+      addError("upload failed: " + (d.detail || r.status), false);
+    }
+  } catch (e) { addError("upload failed: " + e.message, false); }
 });
-health();
+
+/* ---------- boot ---------- */
+if (accessCode) { $("code").value = accessCode; unlock(); }
+
+/* ---------- ops dashboard ---------- */
+let opsOpen = false;
+function toggleOps() {
+  opsOpen = !opsOpen;
+  $("sidebar").style.display = opsOpen ? "none" : "";
+  $("main").style.display = opsOpen ? "none" : "";
+  $("ops").classList.toggle("open", opsOpen);
+  $("view-toggle").textContent = opsOpen ? "chat" : "ops";
+  if (opsOpen) loadOps();
+}
+async function loadOps() {
+  const q = "?access_code=" + encodeURIComponent(accessCode);
+  try {
+    const jobs = await (await api("/api/train/list" + q)).json();
+    const list = jobs.jobs || [];
+    $("ops-jobs").innerHTML = list.length ? `<table><tr><th>job</th><th>model</th><th>status</th><th>attempts</th><th></th></tr>` +
+      list.slice(0, 20).map(j => `<tr><td>${j.id.slice(0, 8)}</td><td>${esc(j.model_repo || "")}</td>` +
+        `<td><span class="pill ${j.status}">${j.status}</span></td><td>${j.attempts || 0}</td>` +
+        `<td>${j.status === "failed" ? `<button class="mini-btn" onclick="retryJob('${j.id}')">retry</button>` : ""}</td></tr>`).join("") + `</table>`
+      : `<div class="ops-empty">no train jobs yet</div>`;
+  } catch (e) { $("ops-jobs").innerHTML = `<div class="ops-empty">failed to load</div>`; }
+  try {
+    const w = await (await api("/api/forge/workers" + q)).json();
+    const plats = Object.entries(w.platforms || {}).map(([p, n]) => `${p}: ${n}`).join(", ") || "none";
+    $("ops-workers").innerHTML = `<table><tr><th>alive</th><th>dead</th><th>platforms</th><th>queued jobs</th></tr>` +
+      `<tr><td>${w.alive}</td><td>${w.dead}</td><td>${esc(plats)}</td><td>${w.queued_jobs}</td></tr></table>`;
+  } catch (e) { $("ops-workers").innerHTML = `<div class="ops-empty">failed to load</div>`; }
+  try {
+    const s = await (await api("/api/stats" + q)).json();
+    const rows = s.stats || [];
+    $("ops-stats").innerHTML = rows.length ? `<table><tr><th>day</th><th>provider</th><th>turns</th><th>in chars</th><th>out chars</th></tr>` +
+      rows.slice(0, 28).map(r => `<tr><td>${r.day}</td><td>${esc(r.provider)}</td><td>${r.turns}</td><td>${r.in_chars}</td><td>${r.out_chars}</td></tr>`).join("") + `</table>`
+      : `<div class="ops-empty">no usage yet</div>`;
+  } catch (e) { $("ops-stats").innerHTML = `<div class="ops-empty">failed to load</div>`; }
+  try {
+    const u = await (await api("/api/uploads" + q)).json();
+    const files = u.uploads || [];
+    $("ops-uploads").innerHTML = files.length ? `<table><tr><th>file</th><th>size</th><th>modified</th><th></th></tr>` +
+      files.map(f => `<tr><td>${esc(f.name)}</td><td>${(f.bytes / 1024).toFixed(1)} KB</td>` +
+        `<td>${new Date(f.mtime * 1000).toLocaleString()}</td>` +
+        `<td><button class="mini-btn" onclick="deleteUpload(${JSON.stringify(f.name)})">delete</button></td></tr>`).join("") + `</table>`
+      : `<div class="ops-empty">no uploads yet</div>`;
+  } catch (e) { $("ops-uploads").innerHTML = `<div class="ops-empty">failed to load</div>`; }
+}
+async function deleteUpload(name) {
+  if (!confirm("Delete upload " + name + "?")) return;
+  const q = "?access_code=" + encodeURIComponent(accessCode);
+  const r = await api("/api/uploads/" + encodeURIComponent(name) + q, { method: "DELETE" });
+  if (!r.ok) alert("delete failed: " + r.status);
+  loadOps();
+}
+async function retryJob(id) {
+  await api("/api/train/" + id + "/retry", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ access_code: accessCode }) });
+  loadOps();
+}
+async function reapStuck() {
+  const r = await api("/api/train/reap-stuck", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ access_code: accessCode }) });
+  const d = await r.json();
+  alert("re-queued " + (d.requeued || []).length + " stuck job(s)");
+  loadOps();
+}
+async function reapWorkers() {
+  const r = await api("/api/forge/dispatch/reap", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ access_code: accessCode }) });
+  const d = await r.json();
+  alert("reaped " + d.reaped + " worker(s), re-queued " + (d.requeued || []).length + " job(s)");
+  loadOps();
+}
 </script>
 </body>
 </html>
