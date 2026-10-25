@@ -101,6 +101,24 @@ class ModelRouter:
         cooled = [p for p in self._states if not self._states[p].healthy(now)]
         return healthy + cooled
 
+    def chat_order(self) -> list[str]:
+        """Order for interactive chat: healthy first, streaming provider first
+        within each health group.
+
+        Reaction-time reason: Horde has no token stream and sits in a
+        queue (60s cap), so a Horde-first chat turn shows nothing until
+        the whole queued job finishes. Pollinations streams natively, so
+        it answers visibly in seconds (measured ~4s to first byte). Horde
+        stays as the fallback on refusal/error, so uncensored coverage is
+        preserved — it just isn't the first thing the user waits on.
+        preferred_order() (uncensored-first) is unchanged for everything
+        else; only the chat route uses this order."""
+        now = time.time()
+        healthy = [p for p in self._states if self._states[p].healthy(now)]
+        cooled = [p for p in self._states if not self._states[p].healthy(now)]
+        stream_first = lambda ps: sorted(ps, key=lambda p: 0 if p == "pollinations" else 1)
+        return stream_first(healthy) + stream_first(cooled)
+
     def record_success(self, name: str) -> None:
         st = self._states.get(name)
         if st:

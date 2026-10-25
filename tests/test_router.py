@@ -80,3 +80,17 @@ def test_unknown_provider_ignored():
     r.record_failure("gpt-5")  # no such provider — must not crash
     r.record_success("gpt-5")
     assert r.preferred_order() == ["horde", "pollinations"]
+
+
+def test_chat_order_streams_first_when_healthy():
+    r = ModelRouter()
+    assert r.chat_order() == ["pollinations", "horde"]
+    # Uncensored-first order is untouched for everything else.
+    assert r.preferred_order() == ["horde", "pollinations"]
+
+
+def test_chat_order_health_beats_streaming():
+    r = ModelRouter()
+    r.record_failure("pollinations")
+    r.record_failure("pollinations")  # cooled down: healthy horde leads
+    assert r.chat_order() == ["horde", "pollinations"]

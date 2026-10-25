@@ -166,8 +166,9 @@ def test_http_token_events_precede_done_with_unchanged_done(monkeypatch):
     assert kinds.index("token") < kinds.index("done"), "tokens must arrive before done"
     assert "".join(e["delta"] for e in evts if e["type"] == "token") == "hello there"
     done = next(e for e in evts if e["type"] == "done")
-    # done payload shape unchanged from before this change
-    assert done["reply"] == "hello there" and done["model"] == "horde"
+    # done payload shape unchanged from before this change; chat now
+    # tries the streaming provider first, so the model is pollinations
+    assert done["reply"] == "hello there" and done["model"] == "pollinations"
     assert set(done) == {"type", "reply", "model"}
 
 
