@@ -367,7 +367,12 @@ async def chat(req: ChatRequest, request: Request):
             try:
                 await queue.put({"type": "thread", "thread_id": thread_id})
                 router = get_router()
-                order = router.preferred_order()
+                # Chat uses streaming-first order, not the router's
+                # uncensored-first order: Horde queues with no token stream,
+                # so Horde-first shows nothing until the job finishes (up to
+                # the 60s cap), while Pollinations streams visibly in
+                # seconds. Horde stays as the fallback below.
+                order = router.chat_order()
                 messages = [{"role": m["role"], "content": m["content"]} for m in build_window(history)]
                 final_text, final_source, final_error = "", "", ""
                 # Walk the provider chain: on hard error OR refusal boilerplate
