@@ -50,9 +50,9 @@ def _install(monkeypatch, script):
 
     async def fake_create(preferred=None):
         used.append(preferred)
-        return FakeAgent(script[preferred]), preferred
+        return FakeAgent(script[preferred]), preferred, False
 
-    monkeypatch.setattr(agent_mod, "create_bro_agent", fake_create)
+    monkeypatch.setattr(agent_mod, "get_cached_agent", fake_create)
     return used
 
 
@@ -191,9 +191,9 @@ def test_chat_heartbeat_pings_during_slow_turn(monkeypatch):
             return {"messages": [FakeMsg("slow ok")]}
 
     async def fake_create(preferred=None):
-        return SlowAgent(), preferred
+        return SlowAgent(), preferred, False
 
-    monkeypatch.setattr(agent_mod, "create_bro_agent", fake_create)
+    monkeypatch.setattr(agent_mod, "get_cached_agent", fake_create)
     r = client.post("/api/chat", json={"message": "hi", "access_code": ""})
     evts = _events(r)
     assert any(e["type"] == "ping" for e in evts)  # stream stayed alive mid-turn

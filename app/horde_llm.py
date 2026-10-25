@@ -30,7 +30,7 @@ from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
-from pydantic import PrivateAttr
+from pydantic import Field, PrivateAttr
 
 logger = logging.getLogger(__name__)
 
@@ -272,7 +272,8 @@ async def _ahorde_generate(prompt: str, models: list[str], max_context_length: i
     """Async twin of _horde_generate — same failover, non-blocking polls.
 
     The sync version sleeps the calling thread between polls; inside the
-    FastAPI event loop that stalls every other request for up to 240s, so
+    FastAPI event loop that stalls every other request for up to the
+    Horde timeout (60s by default, see HORDE_CHAT_TIMEOUT_S), so
     the agent path prefers this one.
     """
     api_key = _horde_key()
@@ -356,6 +357,26 @@ def _horde_generate_on(api: str, headers: dict, submit_body: dict, timeout_s: in
     raise RuntimeError("horde: timed out waiting for generation")
 
 
+# Chat-speed cap (was 240s): a single queued Horde job must never hold a
+# chat turn for 4 minutes. 60s is the cap because the router in app/main.py
+# already fails over to the next provider on error — a Horde timeout is a
+# failover trigger, not a dead end — and a queued anonymous job that has
+# not started after 60s (anon queue measured 90+ deep) is unlikely to be
+# the fastest path to an answer. The agent loop can call the model several
+# times per turn (plan, tool calls, final), so 60s per call still allows
+# multi-step tool use while keeping the worst case far under the 600s turn
+# timeout; 240s per call could eat the whole turn budget in 3 calls.
+# Override with HORDE_TIMEOUT_S (seconds) when a slower queue is preferred.
+HORDE_CHAT_TIMEOUT_S = 60
+
+
+def _default_horde_timeout() -> int:
+    try:
+        return max(1, int(os.environ.get("HORDE_TIMEOUT_S", HORDE_CHAT_TIMEOUT_S)))
+    except ValueError:
+        return HORDE_CHAT_TIMEOUT_S
+
+
 class HordeChatModel(BaseChatModel):
     """LangChain chat model backed by AI Horde's keyless uncensored workers,
     with prompt-based tool-call emulation so UniHarness agents can use it."""
@@ -364,7 +385,7 @@ class HordeChatModel(BaseChatModel):
     max_context_length: int = 8192
     max_length: int = 1500
     temperature: float = 0.3
-    timeout_s: int = 240
+    timeout_s: int = Field(default_factory=_default_horde_timeout)
 
     _bound_tools: list[Any] = PrivateAttr(default_factory=list)
 
