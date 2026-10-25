@@ -64,12 +64,22 @@ def add_message(thread_id: str, role: str, content: str) -> None:
 
 
 def get_history(thread_id: str, limit: int = 60) -> list[dict]:
-    """Chronological message history for a thread (oldest first)."""
+    """Chronological message history for a thread (oldest first).
+
+    Returns the NEWEST `limit` messages, not the oldest: the previous
+    implementation (`ORDER BY created_at ASC LIMIT ?`) pinned a long
+    thread's context window to its first 60 messages, so once a thread
+    passed 60 messages the model never saw the recent conversation at
+    all (and build_window() could only trim within that stale slice).
+    rowid breaks created_at ties in insertion order.
+    """
     c = _connect()
     rows = c.execute(
-        "SELECT role, content FROM messages WHERE thread_id = ? ORDER BY created_at ASC LIMIT ?",
-        (thread_id, limit),
+        "SELECT role, content FROM messages WHERE thread_id = ?"
+        " ORDER BY created_at DESC, rowid DESC LIMIT ?",
+        (thread_id, max(1, limit)),
     ).fetchall()
+    rows.reverse()
     return [{"role": r["role"], "content": r["content"]} for r in rows]
 
 
