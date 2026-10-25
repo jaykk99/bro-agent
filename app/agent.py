@@ -19,6 +19,8 @@ LocalNativeComputer, plus web tools and Composio.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
 import os
 from typing import Any
@@ -133,3 +135,79 @@ async def create_bro_agent(preferred: str | None = None):
         system_prompt=SYSTEM_PROMPT,
     )
     return agent, source
+
+
+# ---- Agent cache (chat-speed fix 1) -------------------------------------
+# Before this, POST /api/chat rebuilt the whole agent on EVERY turn (and
+# once per provider attempt): graph compilation, skill discovery, tool
+# construction — all before the first model call. The cache below builds
+# each provider's agent once and reuses it across turns.
+#
+# Why sharing one agent object across concurrent turns is safe here:
+#  * create_bro_agent passes NO checkpointer, so the compiled LangGraph
+#    graph holds no per-conversation state — every turn passes its own
+#    {"messages": [...]} input, and LangGraph invokes with distinct state
+#    per call (the supported concurrent-use pattern).
+#  * LocalNativeComputer runs each command as a transient bash process —
+#    it holds no shell session state to leak between turns.
+#  * The tool objects are stateless per call (params in, output out);
+#    the only shared mutable registries (background-job table, task
+#    registry) are lock-guarded and shared by design across turns.
+#  * The LLM objects are stateless per call (bind_tools copies).
+# One deliberate consequence: a cached agent is NEVER aclose()d mid-process
+# (aclose cancels the shared task registry, which would kill in-flight
+# turns). Cached agents live for the process lifetime; invalidation only
+# drops the reference. No MCP servers are configured in create_bro_agent,
+# so there are no connections to leak by doing this.
+#
+# Invalidation: the fingerprint covers everything that changes what the
+# built agent is (provider, system prompt, workdir, Horde timeout). Env
+# values the tools read lazily at execute time (e.g. COMPOSIO_API_KEY)
+# are NOT in the fingerprint — a rotated key takes effect on the next
+# tool call without a rebuild. Call invalidate_agent_cache() after a
+# config change that the fingerprint does not cover, or from tests.
+
+_AGENT_CACHE: dict[str, tuple[Any, str]] = {}
+_AGENT_CACHE_LOCK = asyncio.Lock()
+
+
+def agent_cache_fingerprint(preferred: str | None) -> str:
+    """Stable key for the agent a turn with `preferred` would build."""
+    parts = [
+        preferred or "chain",
+        SYSTEM_PROMPT,
+        os.environ.get("BRO_WORKDIR", os.path.expanduser("~/bro-work")),
+        os.environ.get("HORDE_TIMEOUT_S", ""),
+        POLLINATIONS_MODEL,
+    ]
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
+
+
+async def get_cached_agent(preferred: str | None = None):
+    """Return (agent, source, cache_hit), building once per fingerprint.
+
+    Creation is serialized by a lock (double-checked after acquiring it)
+    so concurrent first turns build exactly one agent per provider.
+    """
+    key = agent_cache_fingerprint(preferred)
+    hit = _AGENT_CACHE.get(key)
+    if hit is not None:
+        return hit[0], hit[1], True
+    async with _AGENT_CACHE_LOCK:
+        hit = _AGENT_CACHE.get(key)
+        if hit is not None:
+            return hit[0], hit[1], True
+        agent, source = await create_bro_agent(preferred=preferred)
+        _AGENT_CACHE[key] = (agent, source)
+        logger.info("bro agent cached: provider=%s source=%s", preferred or "chain", source)
+        return agent, source, False
+
+
+def invalidate_agent_cache() -> int:
+    """Drop all cached agents (e.g. after a config change). Returns count.
+
+    Does NOT aclose() the dropped agents — see the cache note above.
+    """
+    n = len(_AGENT_CACHE)
+    _AGENT_CACHE.clear()
+    return n

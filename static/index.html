@@ -465,7 +465,7 @@ async function postMessage(text) {
     if (!r.ok) { addError("server error " + r.status, true); return; }
     const reader = r.body.getReader();
     const dec = new TextDecoder();
-    let buf = "", reply = "", done = false;
+    let buf = "", reply = "", done = false, streamEl = null;
     while (true) {
       const { value, done: d } = await reader.read();
       if (d) break;
@@ -487,6 +487,15 @@ async function postMessage(text) {
           else if (evt.stage === "refused") who.textContent = "bro is thinking… (" + evt.provider + " refused, trying next)";
         } else if (evt.type === "ping") {
           // Heartbeat — the turn is still running, nothing to render.
+        } else if (evt.type === "token") {
+          // Live model tokens: append to a streaming bubble as they arrive.
+          // The final `done` reply below replaces this preview, so a
+          // provider hop never leaves a stale preview as the answer.
+          if (!streamEl) streamEl = addMsg("assistant", "", Date.now() / 1000, false);
+          const raw = (streamEl.dataset.raw || "") + (evt.delta || "");
+          streamEl.dataset.raw = raw;
+          streamEl.querySelector(".md").innerHTML = renderMarkdown(raw);
+          scrollBottom();
         } else if (evt.type === "done") {
           reply = evt.reply || ""; done = true;
         } else if (evt.type === "error") {
@@ -496,7 +505,13 @@ async function postMessage(text) {
       }
     }
     if (done || reply) {
-      addMsg("assistant", reply, Date.now() / 1000);
+      if (streamEl) {
+        // Authoritative final reply replaces the streamed preview.
+        streamEl.dataset.raw = reply;
+        streamEl.querySelector(".md").innerHTML = renderMarkdown(reply);
+      } else {
+        addMsg("assistant", reply, Date.now() / 1000);
+      }
       refreshModels(); // provider health may have changed after failover
     } else {
       addError("empty reply from server", true);

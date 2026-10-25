@@ -12,6 +12,8 @@ Endpoints:
   GET  /api/threads/{id}/export — thread as a Markdown download
   POST /api/chat    — chat turn (SSE stream). Body: {message, thread_id?, access_code}
                      Events: thread, progress{stage: trying|failed|refused, provider},
+                     token{delta} (live model tokens; Horde turns emit at most
+                     one, at job completion — see app/chat_stream.py),
                      ping (20s heartbeat), done{reply, model}, error
   POST /api/upload  — upload a file into workdir/uploads/. Form: {file, access_code}
   GET  /api/uploads — list uploaded files (name, bytes, mtime)
@@ -351,7 +353,8 @@ async def chat(req: ChatRequest, request: Request):
     history = memory.get_history(thread_id)
 
     async def stream():
-        from .agent import create_bro_agent
+        from .agent import get_cached_agent
+        from .chat_stream import stream_agent_turn
 
         # The turn runs as a background task feeding an event queue, so the
         # generator can emit progress events and heartbeat pings while a
@@ -375,17 +378,15 @@ async def chat(req: ChatRequest, request: Request):
                 for i, provider in enumerate(order):
                     await queue.put({"type": "progress", "stage": "trying", "provider": provider})
                     try:
-                        agent, source = await create_bro_agent(preferred=provider)
+                        # Cached agent: built once per provider, reused across
+                        # turns (see app/agent.py) instead of rebuilt per turn.
+                        agent, source, _cache_hit = await get_cached_agent(preferred=provider)
                         # Bound the turn: a hung provider must not hang the stream forever.
                         turn_timeout = float(os.environ.get("BRO_TURN_TIMEOUT_S", "600"))
-                        result = await asyncio.wait_for(
-                            agent.ainvoke({"messages": messages}), timeout=turn_timeout
+                        text = await asyncio.wait_for(
+                            stream_agent_turn(agent, messages, queue.put),
+                            timeout=turn_timeout,
                         )
-                        out_messages = result["messages"] if isinstance(result, dict) else []
-                        text = ""
-                        if out_messages:
-                            last = out_messages[-1]
-                            text = getattr(last, "content", "") or str(last)
                         if looks_like_refusal(text) and i < len(order) - 1:
                             logger.warning("provider %s refused legit work, skipping to next", source)
                             router.record_failure(source)
