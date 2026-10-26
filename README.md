@@ -142,4 +142,4 @@ everything else runs dependency-free thanks to the `app/tool_base.py` shim.
 
 ## Live URL
 
-https://bro-agent.onrender.com
+Currently suspended on Render (no live host yet).
