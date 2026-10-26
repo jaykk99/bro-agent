@@ -92,6 +92,38 @@ def test_snapshot_lists_workers_with_alive_flags():
     assert by_id[wid_dead]["current_job_id"] is None  # cleared on reap
 
 
+def test_snapshot_marks_stale_worker_before_reap():
+    # Past the heartbeat timeout but NOT yet reaped: stale, not dead, and
+    # it still holds its job — this is the state ops must see pre-reap.
+    wid = dispatch.register_worker("colab")
+    dispatch.heartbeat(wid, "job-held")
+    _backdate_worker(wid, dispatch.HEARTBEAT_TIMEOUT_S + 120)
+    snap = dispatch.status_snapshot()
+    by_id = {w["id"]: w for w in snap["workers"]}
+    w = by_id[wid]
+    assert w["status"] == "stale"
+    assert w["alive"] is False
+    assert w["current_job_id"] == "job-held"
+    assert dispatch.HEARTBEAT_TIMEOUT_S <= w["seconds_since_heartbeat"] <= dispatch.HEARTBEAT_TIMEOUT_S + 300
+    assert snap["stale"] >= 1
+    # After reap it flips to dead and releases the job.
+    dispatch.reap_dead_workers()
+    snap = dispatch.status_snapshot()
+    by_id = {w["id"]: w for w in snap["workers"]}
+    assert by_id[wid]["status"] == "dead"
+    assert by_id[wid]["current_job_id"] is None
+
+
+def test_snapshot_alive_worker_status_and_age():
+    wid = dispatch.register_worker("kaggle")
+    dispatch.heartbeat(wid, "")
+    snap = dispatch.status_snapshot()
+    w = {x["id"]: x for x in snap["workers"]}[wid]
+    assert w["status"] == "alive"
+    assert w["alive"] is True
+    assert 0 <= w["seconds_since_heartbeat"] < 60
+
+
 def test_reap_idempotent():
     wid = dispatch.register_worker("colab")
     _backdate_worker(wid, dispatch.HEARTBEAT_TIMEOUT_S + 60)

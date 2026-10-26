@@ -99,7 +99,11 @@ def status_snapshot() -> dict:
 
     Also returns the per-worker list (id, platform, last heartbeat, current
     job, alive flag) — the aggregates alone can't tell ops WHICH worker died
-    or what job it was stuck on.
+    or what job it was stuck on. Each worker also carries a `status`
+    ("alive" / "stale" / "dead") and `seconds_since_heartbeat`, and the
+    snapshot carries a top-level `stale` count: a worker past the heartbeat
+    timeout but not yet reaped is "stale", not dead — it still holds its
+    current job, and ops needs to see it before hitting "reap dead".
     """
     from . import train as train_jobs
 
@@ -109,22 +113,36 @@ def status_snapshot() -> dict:
         per_platform[w["platform"]] = per_platform.get(w["platform"], 0) + 1
     c = _connect()
     dead = c.execute("SELECT COUNT(*) FROM forge_workers WHERE dead=1").fetchone()[0]
-    cutoff = time.time() - HEARTBEAT_TIMEOUT_S
-    workers = [
-        {
-            "id": r["id"],
-            "platform": r["platform"],
-            "last_seen": r["last_seen"],
-            "current_job_id": r["current_job_id"] or None,
-            "alive": bool(not r["dead"] and r["last_seen"] >= cutoff),
-        }
-        for r in c.execute(
-            "SELECT id, platform, last_seen, current_job_id, dead "
-            "FROM forge_workers ORDER BY last_seen DESC"
-        ).fetchall()
-    ]
+    now = time.time()
+    cutoff = now - HEARTBEAT_TIMEOUT_S
+    workers = []
+    stale = 0
+    for r in c.execute(
+        "SELECT id, platform, last_seen, current_job_id, dead "
+        "FROM forge_workers ORDER BY last_seen DESC"
+    ).fetchall():
+        is_alive = bool(not r["dead"] and r["last_seen"] >= cutoff)
+        if r["dead"]:
+            status = "dead"
+        elif is_alive:
+            status = "alive"
+        else:
+            status = "stale"
+            stale += 1
+        workers.append(
+            {
+                "id": r["id"],
+                "platform": r["platform"],
+                "last_seen": r["last_seen"],
+                "seconds_since_heartbeat": max(0, int(now - r["last_seen"])),
+                "status": status,
+                "current_job_id": r["current_job_id"] or None,
+                "alive": is_alive,
+            }
+        )
     return {
         "alive": len(alive),
+        "stale": stale,
         "dead": int(dead),
         "platforms": per_platform,
         "queued_jobs": train_jobs.count_queued_jobs(),

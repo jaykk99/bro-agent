@@ -131,6 +131,9 @@
   .pill.working { background:#4a3a12; color:#fbbf24; }
   .pill.done { background:#123f2a; color:#4ade80; }
   .pill.failed { background:#4a1d1d; color:#f87171; }
+  .pill.alive { background:#123f2a; color:#4ade80; }
+  .pill.stale { background:#4a3a12; color:#fbbf24; }
+  .pill.dead { background:#4a1d1d; color:#f87171; }
   .mini-btn { background:none; border:1px solid var(--line); color:var(--dim); border-radius:5px;
               font-size:11px; padding:3px 9px; cursor:pointer; }
   .mini-btn:hover { color:var(--accent); border-color:var(--accent); }
@@ -584,8 +587,15 @@ async function loadOps() {
   try {
     const w = await (await api("/api/forge/workers" + q)).json();
     const plats = Object.entries(w.platforms || {}).map(([p, n]) => `${p}: ${n}`).join(", ") || "none";
-    $("ops-workers").innerHTML = `<table><tr><th>alive</th><th>dead</th><th>platforms</th><th>queued jobs</th></tr>` +
-      `<tr><td>${w.alive}</td><td>${w.dead}</td><td>${esc(plats)}</td><td>${w.queued_jobs}</td></tr></table>`;
+    const ago = (s) => s < 60 ? `${s}s ago` : `${Math.floor(s / 60)}m ago`;
+    const workerRows = (w.workers || []).map(x =>
+      `<tr><td>${esc(x.id.slice(0, 8))}</td><td>${esc(x.platform)}</td>` +
+      `<td><span class="pill ${x.status}">${x.status}</span></td><td>${ago(x.seconds_since_heartbeat ?? 0)}</td>` +
+      `<td>${x.current_job_id ? esc(x.current_job_id.slice(0, 12)) : "&mdash;"}</td></tr>`).join("");
+    $("ops-workers").innerHTML = `<table><tr><th>alive</th><th>stale</th><th>dead</th><th>platforms</th><th>queued jobs</th></tr>` +
+      `<tr><td>${w.alive}</td><td>${w.stale ?? 0}</td><td>${w.dead}</td><td>${esc(plats)}</td><td>${w.queued_jobs}</td></tr></table>` +
+      (workerRows ? `<table><tr><th>worker</th><th>platform</th><th>status</th><th>last heartbeat</th><th>job</th></tr>${workerRows}</table>`
+        : `<div class="ops-empty">no forge workers yet</div>`);
   } catch (e) { $("ops-workers").innerHTML = `<div class="ops-empty">failed to load</div>`; }
   try {
     const s = await (await api("/api/stats" + q)).json();
