@@ -111,6 +111,25 @@ def test_thread_export():
     assert client.get("/api/threads/nope/export").status_code == 404
 
 
+def test_thread_export_past_1000_messages():
+    """Export must include the whole thread, not just the first 1000 messages.
+
+    Regression: the export route used to fetch a single page (limit=1000),
+    so a long thread's export silently dropped its most recent messages.
+    """
+    from app import memory
+
+    tid = memory.create_thread("long export")
+    for i in range(1005):
+        role = "user" if i % 2 == 0 else "assistant"
+        memory.add_message(tid, role, f"export message {i}")
+    r = client.get(f"/api/threads/{tid}/export")
+    assert r.status_code == 200
+    assert "export message 0" in r.text
+    assert "export message 1004" in r.text  # past the old 1000-message cap
+    assert r.text.count("\n## ") == 1005
+
+
 def test_upload():
     content = b"x" * 100
     r = client.post(

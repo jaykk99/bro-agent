@@ -9,7 +9,7 @@ Endpoints:
   GET  /api/threads/{id} — thread messages with timestamps (?limit=&offset= for paging)
   POST /api/threads/{id}/rename — rename a thread. Body: {title, access_code}
   DELETE /api/threads/{id} — delete a thread and its messages
-  GET  /api/threads/{id}/export — thread as a Markdown download
+  GET  /api/threads/{id}/export — full thread as a Markdown download (paged, no 1000-message cap)
   POST /api/chat    — chat turn (SSE stream). Body: {message, thread_id?, access_code}
                      Events: thread, progress{stage: trying|failed|refused, provider},
                      token{delta} (live model tokens; Horde turns emit at most
@@ -176,7 +176,20 @@ def thread_export(thread_id: str, access_code: str = ""):
     _check_access(access_code)
     if not memory.thread_exists(thread_id):
         raise HTTPException(status_code=404, detail="thread not found")
-    msgs = memory.get_thread_messages(thread_id, limit=1000)
+    # Page through the whole thread: the old single fetch (limit=1000)
+    # silently dropped every message past the 1000th — i.e. exactly the
+    # recent conversation an export is for. Keep pages under the endpoint's
+    # 1000-message clamp and stop on a short page.
+    msgs: list[dict] = []
+    offset = 0
+    while True:
+        page = memory.get_thread_messages(thread_id, limit=500, offset=offset)
+        if not page:
+            break
+        msgs.extend(page)
+        offset += len(page)
+        if len(page) < 500:
+            break
     lines = [f"# bro chat export", ""]
     for m in msgs:
         who = "Jay" if m["role"] == "user" else "bro"
