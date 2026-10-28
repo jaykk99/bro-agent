@@ -68,3 +68,14 @@ def test_adapter_path_is_traversal_safe():
     assert p.endswith("passwd")
     assert ".." not in p
     assert os.path.dirname(p).endswith("abc123")
+
+
+def test_adapter_path_job_id_is_traversal_safe():
+    # Regression: job_id came raw from the URL, so %2e%2e escaped ADAPTERS_DIR.
+    for evil in ("..", "../..", "..%2f..", "/etc", "a/b"):
+        p = train.adapter_file_path(evil, "adapter.bin")
+        assert os.path.commonpath([p, train.ADAPTERS_DIR]) == train.ADAPTERS_DIR
+        assert ".." not in p
+    # Real uuid-hex ids are untouched.
+    p = train.adapter_file_path("abc123def456", "adapter.bin")
+    assert os.path.dirname(p).endswith("abc123def456")

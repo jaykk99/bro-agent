@@ -136,6 +136,21 @@ def test_claim_rate_limited_after_burst(monkeypatch):
     assert 429 in statuses
 
 
+def test_train_file_download_cannot_traverse_out_of_adapters():
+    # Regression: GET /api/train/%2e%2e/files/<name> used to serve files
+    # sitting next to the adapters dir (e.g. the SQLite DB). Now the job_id
+    # is sanitized, so the traversal resolves inside adapters/ and 404s.
+    from app import train as train_jobs
+
+    sentinel = os.path.join(os.path.dirname(train_jobs.ADAPTERS_DIR), "traverse-sentinel.txt")
+    os.makedirs(os.path.dirname(sentinel), exist_ok=True)
+    with open(sentinel, "w") as f:
+        f.write("SENTINEL")
+    r = client.get("/api/train/%2e%2e/files/traverse-sentinel.txt")
+    assert r.status_code == 404
+    assert "SENTINEL" not in r.text
+
+
 def test_cli_imports():
     import app.cli as cli
 

@@ -212,8 +212,15 @@ def count_queued_jobs() -> int:
 
 
 def adapter_file_path(job_id: str, filename: str) -> str:
-    """Sanitized on-disk path for an uploaded adapter file (path traversal safe)."""
+    """Sanitized on-disk path for an uploaded adapter file (path traversal safe).
+
+    Both segments are sanitized: the filename was already basenamed, but the
+    job_id came straight from the URL path, so GET /api/train/%2e%2e/files/x
+    used to resolve outside ADAPTERS_DIR and serve arbitrary files next to it.
+    Real job ids are uuid hex, so the allowlist below changes nothing legit.
+    """
+    safe_job = re.sub(r"[^A-Za-z0-9_-]", "_", job_id or "")[:64] or "job"
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(filename or ""))[:128] or "file"
-    d = os.path.join(ADAPTERS_DIR, job_id)
+    d = os.path.join(ADAPTERS_DIR, safe_job)
     os.makedirs(d, exist_ok=True)
     return os.path.join(d, safe)
