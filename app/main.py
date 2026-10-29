@@ -51,6 +51,7 @@ from . import train as train_jobs
 from . import dispatch as forge_dispatch
 from .context import build_window
 from .guards import check_hard_boundary
+from .guard_policy import check_owner_boundary
 from . import rate_limit
 from . import stats
 from .router import get_router, looks_like_refusal
@@ -368,7 +369,11 @@ async def chat(req: ChatRequest, request: Request):
         raise HTTPException(status_code=400, detail=f"message too long ({MAX_MESSAGE_CHARS} char cap)")
 
     # Hard-boundary pre-check (surgical guards only — legit work always passes).
-    hit = check_hard_boundary(message)
+    # Per-deployment refusal policy (app/guard_policy.py) runs second: this
+    # instance's own owner-written patterns. Ships empty — nothing extra
+    # refused until the owner adds an entry. The hard floor above is
+    # separate and always applies first.
+    hit = check_hard_boundary(message) or check_owner_boundary(message)
     if hit:
         thread_id = req.thread_id or memory.create_thread(message[:40])
         memory.add_message(thread_id, "user", message)

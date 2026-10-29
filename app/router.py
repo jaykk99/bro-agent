@@ -27,6 +27,8 @@ import re
 import time
 from dataclasses import dataclass, field
 
+from . import guard_policy
+
 PROVIDERS = ("horde", "pollinations")
 
 # Two consecutive failures -> 5 minute cooldown.
@@ -68,6 +70,11 @@ def looks_like_refusal(text: str) -> bool:
 
     Only the *start* of the reply is considered (first 400 chars) — a long
     legit answer that quotes a refusal somewhere inside must not trigger.
+
+    Per-deployment soft policy (app/guard_policy.py): the owner can turn
+    refusal-skipping OFF (first answer returned as-is) and can add their
+    own boilerplate patterns to the built-in list. Defaults preserve
+    current behaviour: skip ON, zero extra patterns shipped.
     """
     head = (text or "").strip()[:400]
     if not head:
@@ -75,7 +82,19 @@ def looks_like_refusal(text: str) -> bool:
     # Idiom guard: "I can't help but notice..." is not a refusal.
     if re.search(r"can'?t\s+help\s+but\b", head, re.I):
         return False
-    return bool(_REFUSAL_RX.search(head))
+    if not guard_policy.SKIP_REFUSALS:
+        return False
+    if _REFUSAL_RX.search(head):
+        return True
+    extra = guard_policy.effective_refusal_patterns()
+    if extra:
+        try:
+            rx = re.compile("|".join(f"(?:{p})" for p in extra), re.I)
+        except re.error:
+            rx = None
+        if rx is not None and rx.search(head):
+            return True
+    return False
 
 
 @dataclass
@@ -95,10 +114,24 @@ class ModelRouter:
         self._states: dict[str, _ProviderState] = {p: _ProviderState(p) for p in providers}
 
     def preferred_order(self) -> list[str]:
-        """Healthy providers first (in configured order), then cooled-down ones."""
+        """Healthy providers first, then cooled-down ones.
+
+        Within each health group, order follows the per-deployment routing
+        preference (app/guard_policy.py): UNCENSORED_FIRST on (default) =
+        configured order, uncensored provider first; off = reversed, the
+        aligned fallback leads.
+        """
         now = time.time()
-        healthy = [p for p in self._states if self._states[p].healthy(now)]
-        cooled = [p for p in self._states if not self._states[p].healthy(now)]
+        base = list(self._states)
+        if not guard_policy.UNCENSORED_FIRST:
+            base.reverse()
+        rank = {p: i for i, p in enumerate(base)}
+        healthy = sorted(
+            (p for p in self._states if self._states[p].healthy(now)),
+            key=lambda p: rank[p])
+        cooled = sorted(
+            (p for p in self._states if not self._states[p].healthy(now)),
+            key=lambda p: rank[p])
         return healthy + cooled
 
     def chat_order(self) -> list[str]:

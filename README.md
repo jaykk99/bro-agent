@@ -73,12 +73,9 @@ streams chat in a REPL (`/new`, `/threads`, `/thread <id>`, `/quit`).
 
 ## Guardrails
 
-7 surgical guards (ported from error-inbox PR #209, living in
-`app/refusal.py` and only there) block only unambiguous hard-boundary intent:
-stolen cards, phishing/fraud, wallet theft, unauthorized hacking, weapons of
-mass harm, CSAM, doxxing. Each needs a criminal action + criminal target —
-bare keywords never match, legit work always passes. Everything else: zero
-refusal boilerplate. See `docs/SECURITY.md` for the full security model.
+Refusal policy is yours: edit `app/guard_policy.py` to set what your instance refuses; it ships empty. This app is a template — whoever deploys an instance writes their own refusal policy in that one file (or the `BRO_GUARD_*` env vars): your own block patterns for user messages, any extra model-refusal patterns for the router's skip logic, and the behaviour switches for refusal-skipping and uncensored-first routing. Zero preset entries ship in the lists.
+
+Under that sits a small hard floor that is bro-agent's own code and always on: 7 surgical guards in `app/refusal.py` block only unambiguous hard-boundary intent — stolen cards, phishing/fraud, wallet theft, unauthorized hacking, weapons of mass harm, CSAM, doxxing. Each needs a criminal action + criminal target — bare keywords never match, and legit work passes (the battery in `tests/test_refusal_battery.py` proves both directions). The floor is not in the config and cannot be configured away. See `docs/SECURITY.md` for the full security model.
 
 ## API
 

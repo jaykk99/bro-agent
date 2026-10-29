@@ -5,7 +5,7 @@ connected integrations. It is internet-facing (Render) behind an access
 code. This doc describes the layers that keep it safe without getting in
 the way of legit work.
 
-## 1. Hard-boundary pre-check (the only refusals, ever)
+## 1. Hard-boundary pre-check (the hard floor)
 
 `app/refusal.py` — and only there — holds 7 surgical guards: stolen cards,
 phishing/fraud kits, wallet theft, unauthorized hacking, weapons of mass
@@ -19,6 +19,16 @@ reason plus the nearest legitimate alternative.
   shim fails open (app stays up, no pre-check) instead of crashing.
 - These guards are never removed or loosened by tooling work — they are a
   standing hard gate.
+
+### Per-deployment refusal policy (`app/guard_policy.py`)
+
+On top of the floor sits the deployment's own soft policy. Refusal policy
+is yours: edit `app/guard_policy.py` to set what your instance refuses; it
+ships empty (zero preset block patterns, zero preset refusal patterns).
+The owner of an instance can add block patterns for user messages, extra
+model-refusal patterns for the router's skip logic, and the switches for
+refusal-skipping and uncensored-first routing (`BRO_GUARD_*` env vars work
+too). The soft policy runs after the hard floor and can never weaken it.
 
 ## 2. SSRF guard (`app/ssrf.py`)
 

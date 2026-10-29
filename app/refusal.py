@@ -1,9 +1,10 @@
-"""app/refusal.py — THE refusal file for bro-agent (owner order, Jay, 2026-10-13):
-all refusal code lives here and only here. The 7 guardrails (stolen cards,
+"""app/refusal.py — bro-agent's hard floor: the 7 guardrails (stolen cards,
 fraud/phishing, wallet theft, unauthorized hacking, weapons/mass harm, CSAM,
 doxxing) plus check_hard_boundary(), the boundary check that enforces them,
-moved verbatim from app/guards.py, which is now a re-export shim so existing
-imports keep working.
+live here. app/guards.py is a re-export shim so existing imports keep
+working. The per-deployment SOFT refusal policy (owner-written patterns and
+behaviour switches, shipping empty) lives separately in app/guard_policy.py
+and can never weaken this floor.
 
 DELETION-SAFE BY DESIGN: this file is optional. If it is deleted, the
 guards.py shim fails open — check_hard_boundary() returns None and the app
@@ -11,7 +12,8 @@ runs without the boundary pre-check instead of crashing.
 
 Hard-boundary pre-check — surgical, unambiguous hard-boundary intent only.
 
-Ported from error-inbox PR #209 (lib/bro/harness.ts). Design: multi-signal
+This is bro-agent's own minimal hard floor — the 7 guards below are the
+whole of it. Design: multi-signal
 matchers (ACTION + CRIMINAL OBJECT). Bare keywords NEVER match — "memory
 dump", "checkout validation", "audio mixing", "mock login", "cold storage
 move", "bath bomb", "nuke the test db" all pass. This is a backstop only;
