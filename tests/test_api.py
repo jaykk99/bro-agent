@@ -151,6 +151,33 @@ def test_train_file_download_cannot_traverse_out_of_adapters():
     assert "SENTINEL" not in r.text
 
 
+def test_train_upload_capped_and_partial_file_removed(monkeypatch):
+    # The generic /api/upload route caps at 50 MB, but train adapter
+    # uploads used to stream unbounded — a runaway worker could fill the
+    # disk. Over the cap: 413 and no partial file left behind.
+    import app.main as main_mod
+    from app import train as train_jobs
+
+    monkeypatch.setattr(main_mod, "ADAPTER_MAX_BYTES", 1024)
+    jid = train_jobs.create_job("Qwen/Qwen2-1.5B")
+    r = client.post(
+        f"/api/train/{jid}/upload",
+        files={"file": ("adapter_model.safetensors", b"x" * 2048)},
+    )
+    assert r.status_code == 413
+    assert "too large" in r.json()["detail"]
+    assert not os.path.exists(train_jobs.adapter_file_path(jid, "adapter_model.safetensors"))
+
+    # Under the cap still uploads fine.
+    r = client.post(
+        f"/api/train/{jid}/upload",
+        files={"file": ("adapter_model.safetensors", b"x" * 512)},
+    )
+    assert r.status_code == 200
+    assert r.json()["filename"] == "adapter_model.safetensors"
+    assert os.path.getsize(train_jobs.adapter_file_path(jid, "adapter_model.safetensors")) == 512
+
+
 def test_cli_imports():
     import app.cli as cli
 

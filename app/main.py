@@ -222,6 +222,21 @@ def train_reap_stuck(req: TrainClaimRequest):
 UPLOAD_MAX_BYTES = 50 * 1024 * 1024
 
 
+def _adapter_max_bytes() -> int:
+    """Per-file cap for train adapter uploads. Default 2 GB: a rank-16
+    adapter is ~100 MB, but the max rank-256 job can legitimately exceed
+    1 GB, so the cap must clear that while still bounding a runaway or
+    hostile upload on bro-agent's ephemeral disk. Override with
+    BRO_ADAPTER_MAX_BYTES (bytes) for bigger jobs or tighter disks."""
+    try:
+        return max(1, int(os.environ.get("BRO_ADAPTER_MAX_BYTES", 2 * 1024**3)))
+    except ValueError:
+        return 2 * 1024**3
+
+
+ADAPTER_MAX_BYTES = _adapter_max_bytes()
+
+
 def _safe_upload_name(name: str) -> str:
     """Same sanitizer as the upload route — names the file can actually have."""
     safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in (name or "file"))[:128]
@@ -518,11 +533,24 @@ async def train_upload(job_id: str, file: UploadFile = File(...), access_code: s
     if not train_jobs.get_job(job_id):
         raise HTTPException(status_code=404, detail="job not found")
     dest = train_jobs.adapter_file_path(job_id, file.filename or "adapter.bin")
+    # The generic /api/upload route caps at 50 MB, but this route used to
+    # stream unbounded — one runaway worker (or bad adapter) could fill
+    # bro-agent's ephemeral disk. Same pattern as /api/upload: 413 and
+    # remove the partial file, so a rejected upload leaves nothing behind.
+    size = 0
     with open(dest, "wb") as f:
         while True:
             chunk = await file.read(1024 * 1024)
             if not chunk:
                 break
+            size += len(chunk)
+            if size > ADAPTER_MAX_BYTES:
+                f.close()
+                os.unlink(dest)
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"adapter file too large ({ADAPTER_MAX_BYTES} byte cap; set BRO_ADAPTER_MAX_BYTES to raise it)",
+                )
             f.write(chunk)
     return {"ok": True, "filename": os.path.basename(dest)}
 

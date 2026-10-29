@@ -37,7 +37,7 @@ status, metrics, adapter download  <----  /api/train/{id}/files/adapter_model.sa
 - `GET /api/train/{id}?access_code=` — one job: status, result_url, metrics, error
 - `POST /api/train/claim` — worker only. Body: `{access_code}` → oldest queued job, atomically marked `working`; 404 when the queue is empty
 - `POST /api/train/{id}/complete` — worker only. Body: `{access_code, status: "done"|"failed", result_url?, metrics?, error?}`
-- `POST /api/train/{id}/upload` — worker only. Multipart form: `file` + `access_code`. Filenames are sanitized server-side (path traversal safe)
+- `POST /api/train/{id}/upload` — worker only. Multipart form: `file` + `access_code`. Filenames are sanitized server-side (path traversal safe). Per-file cap 2 GB by default (413 + partial file removed over the cap); override with `BRO_ADAPTER_MAX_BYTES`
 - `GET /api/train/{id}/files/{name}?access_code=` — download an adapter file
 - `POST /api/train/{id}/retry` — re-queue a `failed` job (body: `{access_code}`).
   Attempts are tracked per job and capped at 3 — a poison job stops retrying
