@@ -79,3 +79,52 @@ def test_adapter_path_job_id_is_traversal_safe():
     # Real uuid-hex ids are untouched.
     p = train.adapter_file_path("abc123def456", "adapter.bin")
     assert os.path.dirname(p).endswith("abc123def456")
+
+
+def test_adapter_path_dot_filenames_are_plain_files():
+    # "." / ".." used to resolve to the job dir itself (uploading to ".."
+    # then crashed opening a directory). They now map to a plain file.
+    for dot in (".", ".."):
+        p = train.adapter_file_path("abc123", dot)
+        assert os.path.basename(p) == "file"
+        assert os.path.dirname(p).endswith("abc123")
+
+
+def test_adapter_path_get_does_not_create_dirs():
+    # A download for a bogus job used to mkdir adapters/<bogus>/.
+    p = train.adapter_file_path("no-such-job-xyz", "adapter.bin")
+    assert not os.path.exists(os.path.dirname(p))
+    assert not os.path.exists(p)
+
+
+def test_adapter_path_symlinked_job_dir_refused_on_create():
+    # A symlink planted at adapters/<job>/ pointing outside must not be
+    # treated as a job dir when the upload route creates it.
+    import tempfile
+
+    outside = tempfile.mkdtemp(prefix="bro-adapter-outside-")
+    link_dir = os.path.join(train.ADAPTERS_DIR, "symjob")
+    os.makedirs(train.ADAPTERS_DIR, exist_ok=True)
+    if os.path.lexists(link_dir):
+        os.unlink(link_dir)
+    os.symlink(outside, link_dir)
+    try:
+        import pytest
+
+        with pytest.raises(ValueError):
+            train.adapter_file_path("symjob", "adapter.bin", create_dir=True)
+    finally:
+        os.unlink(link_dir)
+
+
+def test_adapter_total_bytes():
+    jid = train.create_job("model-total")
+    assert train.adapter_total_bytes(jid) == 0
+    p = train.adapter_file_path(jid, "a.bin", create_dir=True)
+    with open(p, "wb") as f:
+        f.write(b"x" * 100)
+    p2 = train.adapter_file_path(jid, "b.bin")
+    with open(p2, "wb") as f:
+        f.write(b"y" * 50)
+    assert train.adapter_total_bytes(jid) == 150
+    assert train.adapter_total_bytes("no-such-job-xyz") == 0

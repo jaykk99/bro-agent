@@ -211,16 +211,63 @@ def count_queued_jobs() -> int:
     return int(row[0]) if row else 0
 
 
-def adapter_file_path(job_id: str, filename: str) -> str:
+def adapter_job_dir(job_id: str) -> str:
+    """Sanitized on-disk directory for one job's adapter files (no creation)."""
+    safe_job = re.sub(r"[^A-Za-z0-9_-]", "_", job_id or "")[:64] or "job"
+    return os.path.join(ADAPTERS_DIR, safe_job)
+
+
+def adapter_total_bytes(job_id: str) -> int:
+    """Bytes already stored for one job (lstat sizes, so a symlink entry
+    counts only its own link size, never its target's). Missing dir = 0."""
+    d = adapter_job_dir(job_id)
+    total = 0
+    try:
+        with os.scandir(d) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        total += entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    continue
+    except OSError:
+        return 0
+    return total
+
+
+def adapter_file_path(job_id: str, filename: str, create_dir: bool = False) -> str:
     """Sanitized on-disk path for an uploaded adapter file (path traversal safe).
 
     Both segments are sanitized: the filename was already basenamed, but the
     job_id came straight from the URL path, so GET /api/train/%2e%2e/files/x
     used to resolve outside ADAPTERS_DIR and serve arbitrary files next to it.
     Real job ids are uuid hex, so the allowlist below changes nothing legit.
+
+    Hardening, 2026-10-30 (the per-file 2 GB cap from 2026-10-29 did not
+    bound the job, and this path never jailed symlinks):
+      * dot-only filenames ("." / "..") used to resolve to the job dir
+        itself (an upload to ".." then crashed opening a directory); they
+        now map to a plain file, like any other bad name.
+      * the path is NOT created by default: a GET for a bogus job used to
+        mkdir adapters/<bogus>/ as a side effect, so anyone with the access
+        code could litter the disk with directories. Only the upload route
+        passes create_dir=True.
+      * when creating, the real job dir must stay inside ADAPTERS_DIR —
+        a symlink planted at adapters/<job>/ used to make every later
+        upload overwrite, and every download serve, the link target
+        outside the adapters tree (proven with a planted link before this
+        fix). A symlinked job dir raises ValueError here; the routes also
+        refuse a symlinked file itself.
     """
     safe_job = re.sub(r"[^A-Za-z0-9_-]", "_", job_id or "")[:64] or "job"
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(filename or ""))[:128] or "file"
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(filename or ""))[:128]
+    if safe in ("", ".", ".."):
+        safe = "file"
     d = os.path.join(ADAPTERS_DIR, safe_job)
-    os.makedirs(d, exist_ok=True)
+    if create_dir:
+        os.makedirs(d, exist_ok=True)
+        real_root = os.path.realpath(ADAPTERS_DIR)
+        real_dir = os.path.realpath(d)
+        if os.path.commonpath([real_dir, real_root]) != real_root:
+            raise ValueError("adapter job dir escapes the adapters directory")
     return os.path.join(d, safe)

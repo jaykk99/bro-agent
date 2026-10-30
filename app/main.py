@@ -238,6 +238,31 @@ def _adapter_max_bytes() -> int:
 ADAPTER_MAX_BYTES = _adapter_max_bytes()
 
 
+def _adapter_job_max_bytes() -> int:
+    """Total adapter bytes allowed per job. Default 4 GB: the per-file cap
+    alone never bounded a job — a worker (or a bad adapter loop) could
+    upload unlimited 2 GB files to one job and fill the disk. 4 GB covers
+    one max-size adapter plus shards, and never sits below the per-file
+    cap, so a single legit max-size file always fits. Override with
+    BRO_ADAPTER_JOB_MAX_BYTES (bytes). Read per request so tests and
+    deploys can tighten it without a restart."""
+    try:
+        env = os.environ.get("BRO_ADAPTER_JOB_MAX_BYTES", "")
+        if env.strip():
+            return max(1, int(env))
+    except ValueError:
+        pass
+    return max(4 * 1024**3, ADAPTER_MAX_BYTES)
+
+
+def _adapter_dest_is_symlink(dest: str) -> bool:
+    """True if the file itself or its job dir is a symlink. Adapter files
+    are only ever created as regular files by the upload route, so any
+    symlink here is planted, not legit — refuse it instead of following it
+    to a target outside the adapters tree."""
+    return os.path.islink(dest) or os.path.islink(os.path.dirname(dest))
+
+
 def _safe_upload_name(name: str) -> str:
     """Same sanitizer as the upload route — names the file can actually have."""
     safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in (name or "file"))[:128]
@@ -537,11 +562,24 @@ async def train_upload(job_id: str, file: UploadFile = File(...), access_code: s
     _check_access(access_code)
     if not train_jobs.get_job(job_id):
         raise HTTPException(status_code=404, detail="job not found")
-    dest = train_jobs.adapter_file_path(job_id, file.filename or "adapter.bin")
+    try:
+        dest = train_jobs.adapter_file_path(job_id, file.filename or "adapter.bin", create_dir=True)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="adapter path refused")
+    if _adapter_dest_is_symlink(dest):
+        raise HTTPException(status_code=400, detail="adapter path is a symlink, refused")
     # The generic /api/upload route caps at 50 MB, but this route used to
     # stream unbounded — one runaway worker (or bad adapter) could fill
     # bro-agent's ephemeral disk. Same pattern as /api/upload: 413 and
     # remove the partial file, so a rejected upload leaves nothing behind.
+    # The per-file cap alone did not bound the job: unlimited files per
+    # job still filled the disk, so the job total is capped too (a
+    # re-upload of the same name replaces its old bytes, it does not
+    # double-count them).
+    job_max = _adapter_job_max_bytes()
+    base_total = train_jobs.adapter_total_bytes(job_id)
+    if os.path.isfile(dest) and not os.path.islink(dest):
+        base_total = max(0, base_total - os.path.getsize(dest))
     size = 0
     with open(dest, "wb") as f:
         while True:
@@ -549,12 +587,12 @@ async def train_upload(job_id: str, file: UploadFile = File(...), access_code: s
             if not chunk:
                 break
             size += len(chunk)
-            if size > ADAPTER_MAX_BYTES:
+            if size > ADAPTER_MAX_BYTES or base_total + size > job_max:
                 f.close()
                 os.unlink(dest)
                 raise HTTPException(
                     status_code=413,
-                    detail=f"adapter file too large ({ADAPTER_MAX_BYTES} byte cap; set BRO_ADAPTER_MAX_BYTES to raise it)",
+                    detail=f"adapter file too large ({ADAPTER_MAX_BYTES} byte per-file cap, {job_max} byte per-job cap; set BRO_ADAPTER_MAX_BYTES / BRO_ADAPTER_JOB_MAX_BYTES to raise them)",
                 )
             f.write(chunk)
     return {"ok": True, "filename": os.path.basename(dest)}
@@ -563,7 +601,15 @@ async def train_upload(job_id: str, file: UploadFile = File(...), access_code: s
 @app.get("/api/train/{job_id}/files/{filename}")
 def train_file(job_id: str, filename: str, access_code: str = ""):
     _check_access(access_code)
+    # No dir creation here: adapter_file_path used to mkdir on every GET,
+    # so a bogus-job download littered adapters/ with empty directories.
     dest = train_jobs.adapter_file_path(job_id, filename)
+    if _adapter_dest_is_symlink(dest):
+        raise HTTPException(status_code=404, detail="file not found")
+    if os.path.realpath(dest) != dest and os.path.commonpath(
+        [os.path.realpath(dest), os.path.realpath(train_jobs.ADAPTERS_DIR)]
+    ) != os.path.realpath(train_jobs.ADAPTERS_DIR):
+        raise HTTPException(status_code=404, detail="file not found")
     if not os.path.isfile(dest):
         raise HTTPException(status_code=404, detail="file not found")
     return FileResponse(dest)
