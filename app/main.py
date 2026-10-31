@@ -41,6 +41,7 @@ import json
 import logging
 import os
 import time
+import uuid
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
@@ -576,25 +577,56 @@ async def train_upload(job_id: str, file: UploadFile = File(...), access_code: s
     # job still filled the disk, so the job total is capped too (a
     # re-upload of the same name replaces its old bytes, it does not
     # double-count them).
+    #
+    # Atomicity, 2026-10-31: the old code streamed straight into the
+    # final destination, which had two consequences. A re-upload that
+    # tripped a cap truncated the old file first, then the 413 handler
+    # unlinked it — the previously good adapter was destroyed, not just
+    # the rejected bytes. And a download running mid-upload served the
+    # truncated, half-written file as a complete adapter. Now the upload
+    # streams into an unguessable temp file in the same job dir and only
+    # os.replace()s it into place once the whole upload fits under both
+    # caps, so a rejected upload leaves the old file untouched and a
+    # download never sees a partial file. The symlink is re-checked just
+    # before the replace, so a link planted mid-upload is refused rather
+    # than followed — and even without that check, os.replace() swaps
+    # the link itself, never its target.
     job_max = _adapter_job_max_bytes()
     base_total = train_jobs.adapter_total_bytes(job_id)
     if os.path.isfile(dest) and not os.path.islink(dest):
         base_total = max(0, base_total - os.path.getsize(dest))
+    tmp = os.path.join(
+        os.path.dirname(dest), f".upload-{uuid.uuid4().hex}.tmp"
+    )
     size = 0
-    with open(dest, "wb") as f:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > ADAPTER_MAX_BYTES or base_total + size > job_max:
-                f.close()
-                os.unlink(dest)
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"adapter file too large ({ADAPTER_MAX_BYTES} byte per-file cap, {job_max} byte per-job cap; set BRO_ADAPTER_MAX_BYTES / BRO_ADAPTER_JOB_MAX_BYTES to raise them)",
-                )
-            f.write(chunk)
+    try:
+        with open(tmp, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > ADAPTER_MAX_BYTES or base_total + size > job_max:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"adapter file too large ({ADAPTER_MAX_BYTES} byte per-file cap, {job_max} byte per-job cap; set BRO_ADAPTER_MAX_BYTES / BRO_ADAPTER_JOB_MAX_BYTES to raise them)",
+                    )
+                f.write(chunk)
+    except BaseException:
+        # Rejected or aborted upload: drop the temp file, leave whatever
+        # was at dest (including a good previous adapter) exactly as is.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    if _adapter_dest_is_symlink(dest):
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise HTTPException(status_code=400, detail="adapter path is a symlink, refused")
+    os.replace(tmp, dest)
     return {"ok": True, "filename": os.path.basename(dest)}
 
 
@@ -603,6 +635,10 @@ def train_file(job_id: str, filename: str, access_code: str = ""):
     _check_access(access_code)
     # No dir creation here: adapter_file_path used to mkdir on every GET,
     # so a bogus-job download littered adapters/ with empty directories.
+    # Upload temp files are never servable either: a download naming one
+    # must 404 even if it guesses the unguessable temp name mid-upload.
+    if os.path.basename(filename or "").startswith(".upload-"):
+        raise HTTPException(status_code=404, detail="file not found")
     dest = train_jobs.adapter_file_path(job_id, filename)
     if _adapter_dest_is_symlink(dest):
         raise HTTPException(status_code=404, detail="file not found")
