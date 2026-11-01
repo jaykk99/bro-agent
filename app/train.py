@@ -11,6 +11,8 @@ Auth: every HTTP route goes through the app's access-code gate in main.py.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
 import re
@@ -215,6 +217,39 @@ def adapter_job_dir(job_id: str) -> str:
     """Sanitized on-disk directory for one job's adapter files (no creation)."""
     safe_job = re.sub(r"[^A-Za-z0-9_-]", "_", job_id or "")[:64] or "job"
     return os.path.join(ADAPTERS_DIR, safe_job)
+
+
+_job_upload_locks: dict[str, asyncio.Lock] = {}
+_job_upload_locks_guard = threading.Lock()
+
+
+@contextlib.asynccontextmanager
+async def adapter_upload_lock(job_id: str):
+    """Serialize uploads to one job (different jobs still run in parallel).
+
+    The per-job cap is enforced check-then-stream: the route snapshots
+    the job's stored bytes, streams against that snapshot, then replaces
+    the file. With no lock, two concurrent uploads to one job both
+    snapshot before either lands and both fit on their own numbers, so
+    the job ends up over its cap (proven 2026-11-01: two 20 MB uploads
+    against a 30 MB cap both returned 200 and stored 40 MB). Holding this
+    lock across snapshot, stream, and replace makes the second upload see
+    the first one's landed bytes and 413 like a sequential upload would.
+
+    This must be an asyncio lock, not a threading lock: the upload route
+    is async and awaits file reads while holding it, and a threading lock
+    would block the event-loop thread on the second acquirer and deadlock
+    the first upload's progress. The registry guard is a threading lock
+    only because it is held for a dict lookup with no await inside it.
+    """
+    key = os.path.basename(adapter_job_dir(job_id))
+    with _job_upload_locks_guard:
+        lock = _job_upload_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _job_upload_locks[key] = lock
+    async with lock:
+        yield
 
 
 def adapter_total_bytes(job_id: str) -> int:
