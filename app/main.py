@@ -256,6 +256,23 @@ def _adapter_job_max_bytes() -> int:
     return max(4 * 1024**3, ADAPTER_MAX_BYTES)
 
 
+def _adapter_total_max_bytes() -> int:
+    """Total adapter bytes allowed across ALL jobs. Default 20 GB: the
+    per-job cap alone never bounded the tree — every job could hold its
+    own 4 GB, so N jobs filled the disk N times over. 20 GB clears five
+    max-size jobs and never sits below the per-job cap, so one legit
+    max-size job always fits. Override with BRO_ADAPTER_TOTAL_MAX_BYTES
+    (bytes). Read per request so tests and deploys can tighten it
+    without a restart."""
+    try:
+        env = os.environ.get("BRO_ADAPTER_TOTAL_MAX_BYTES", "")
+        if env.strip():
+            return max(1, int(env))
+    except ValueError:
+        pass
+    return max(20 * 1024**3, _adapter_job_max_bytes())
+
+
 def _adapter_dest_is_symlink(dest: str) -> bool:
     """True if the file itself or its job dir is a symlink. Adapter files
     are only ever created as regular files by the upload route, so any
@@ -599,43 +616,83 @@ async def train_upload(job_id: str, file: UploadFile = File(...), access_code: s
     # concurrent second upload sees the first one's landed bytes and 413s
     # exactly as a sequential one would. Uploads to different jobs are
     # unaffected — the lock is per job, not global.
+    # Aggregate cap, 2026-11-02: the per-job cap never bounded the tree —
+    # every job could hold its own 4 GB, so uploads to many jobs filled
+    # the disk job by job. The total cap below is checked the same way,
+    # against a committed snapshot plus the in-flight reservation ledger
+    # (train.py): a concurrent upload to another job reserves its
+    # streamed bytes as it goes, so its not-yet-landed bytes already
+    # count here, and two jobs racing the total cap cannot both land
+    # over it. A re-upload replaces its old file, so the old bytes are
+    # subtracted from the snapshot exactly as for the per-job cap.
     async with train_jobs.adapter_upload_lock(job_id):
         job_max = _adapter_job_max_bytes()
+        total_max = _adapter_total_max_bytes()
         base_total = train_jobs.adapter_total_bytes(job_id)
+        global_base = train_jobs.adapters_total_bytes()
+        old_size = 0
         if os.path.isfile(dest) and not os.path.islink(dest):
-            base_total = max(0, base_total - os.path.getsize(dest))
+            old_size = os.path.getsize(dest)
+            base_total = max(0, base_total - old_size)
         tmp = os.path.join(
             os.path.dirname(dest), f".upload-{uuid.uuid4().hex}.tmp"
         )
         size = 0
+        token = uuid.uuid4().hex
+        train_jobs.reserve_upload(token, 0)
         try:
-            with open(tmp, "wb") as f:
-                while True:
-                    chunk = await file.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    size += len(chunk)
-                    if size > ADAPTER_MAX_BYTES or base_total + size > job_max:
-                        raise HTTPException(
-                            status_code=413,
-                            detail=f"adapter file too large ({ADAPTER_MAX_BYTES} byte per-file cap, {job_max} byte per-job cap; set BRO_ADAPTER_MAX_BYTES / BRO_ADAPTER_JOB_MAX_BYTES to raise them)",
-                        )
-                    f.write(chunk)
-        except BaseException:
-            # Rejected or aborted upload: drop the temp file, leave whatever
-            # was at dest (including a good previous adapter) exactly as is.
             try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        if _adapter_dest_is_symlink(dest):
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise HTTPException(status_code=400, detail="adapter path is a symlink, refused")
-        os.replace(tmp, dest)
+                with open(tmp, "wb") as f:
+                    while True:
+                        chunk = await file.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        train_jobs.reserve_upload(token, size)
+                        if (
+                            size > ADAPTER_MAX_BYTES
+                            or base_total + size > job_max
+                            or global_base - old_size + train_jobs.inflight_reserved_bytes() > total_max
+                        ):
+                            raise HTTPException(
+                                status_code=413,
+                                detail=f"adapter file too large ({ADAPTER_MAX_BYTES} byte per-file cap, {job_max} byte per-job cap, {total_max} byte total cap; set BRO_ADAPTER_MAX_BYTES / BRO_ADAPTER_JOB_MAX_BYTES / BRO_ADAPTER_TOTAL_MAX_BYTES to raise them)",
+                            )
+                        f.write(chunk)
+            except BaseException:
+                # Rejected or aborted upload: drop the temp file, leave whatever
+                # was at dest (including a good previous adapter) exactly as is.
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            # Final re-check under the cross-job commit lock: the
+            # per-chunk check above reads a snapshot from upload start,
+            # so an upload that landed and released mid-stream would be
+            # invisible to it. Re-scanning here catches that case, and
+            # the lock keeps two racing uploads from both passing and
+            # both landing. A 413 here still drops only the temp file.
+            with train_jobs.adapter_commit_lock():
+                if _adapter_dest_is_symlink(dest):
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    raise HTTPException(status_code=400, detail="adapter path is a symlink, refused")
+                fresh_total = train_jobs.adapters_total_bytes()
+                if fresh_total - old_size + train_jobs.inflight_reserved_bytes() > total_max:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"adapter file too large ({ADAPTER_MAX_BYTES} byte per-file cap, {job_max} byte per-job cap, {total_max} byte total cap; set BRO_ADAPTER_MAX_BYTES / BRO_ADAPTER_JOB_MAX_BYTES / BRO_ADAPTER_TOTAL_MAX_BYTES to raise them)",
+                    )
+                os.replace(tmp, dest)
+        finally:
+            train_jobs.release_upload(token)
     return {"ok": True, "filename": os.path.basename(dest)}
 
 

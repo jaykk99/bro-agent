@@ -252,6 +252,91 @@ async def adapter_upload_lock(job_id: str):
         yield
 
 
+def adapters_total_bytes() -> int:
+    """Bytes stored for ALL jobs (lstat sizes, never a symlink target's).
+
+    This is the committed-files snapshot for the aggregate cap. It
+    deliberately skips in-flight `.upload-*.tmp` files: those bytes are
+    tracked by the upload reservation ledger instead, so counting them
+    here too would double-count every concurrent upload. A symlinked
+    job dir is skipped whole — its contents are not this tree's files.
+    Missing adapters dir = 0."""
+    total = 0
+    try:
+        with os.scandir(ADAPTERS_DIR) as job_dirs:
+            job_dirs = list(job_dirs)
+    except OSError:
+        return 0
+    for job_dir in job_dirs:
+        try:
+            if not job_dir.is_dir(follow_symlinks=False):
+                continue
+            with os.scandir(job_dir.path) as entries:
+                for entry in entries:
+                    try:
+                        if entry.name.startswith(".upload-") and entry.name.endswith(".tmp"):
+                            continue
+                        if entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
+# In-flight upload reservations for the aggregate cap. The per-job lock
+# serializes uploads to one job, but uploads to DIFFERENT jobs run
+# concurrently, so a snapshot-then-stream aggregate check would let two
+# jobs each fit on their own numbers and land over the total together —
+# the same race the per-job lock fixed for one job. Each upload instead
+# reserves the bytes it has streamed so far; the aggregate check reads
+# the committed snapshot plus every live reservation, so a concurrent
+# upload's not-yet-landed bytes already count against the cap. The
+# ledger is a plain dict under a threading lock: updates happen between
+# awaits, never across one, so it is safe to touch from the async route
+# and cannot deadlock the event loop.
+_inflight_reserved: dict[str, int] = {}
+_inflight_lock = threading.Lock()
+
+
+def reserve_upload(token: str, size: int) -> None:
+    """Record how many bytes one in-flight upload has streamed so far."""
+    with _inflight_lock:
+        _inflight_reserved[token] = max(0, size)
+
+
+def release_upload(token: str) -> None:
+    """Drop one upload's reservation (landed, rejected, or aborted)."""
+    with _inflight_lock:
+        _inflight_reserved.pop(token, None)
+
+
+def inflight_reserved_bytes() -> int:
+    """Bytes currently reserved by all in-flight uploads."""
+    with _inflight_lock:
+        return sum(_inflight_reserved.values())
+
+
+_commit_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def adapter_commit_lock():
+    """Serialize the final cap re-check + replace across jobs.
+
+    The per-chunk aggregate check reads a snapshot taken at upload
+    start, so an upload that lands and releases mid-stream would go
+    invisible to it for the rest of the stream. The final re-check
+    under this lock re-scans committed bytes just before the replace,
+    so two jobs racing the total cap cannot both pass and both land.
+    Held only for a scan plus a replace — never across streaming — so
+    uploads still run in parallel; only their final instant serializes.
+    A threading lock is safe here: no await happens inside it."""
+    with _commit_lock:
+        yield
+
+
 def adapter_total_bytes(job_id: str) -> int:
     """Bytes already stored for one job (lstat sizes, so a symlink entry
     counts only its own link size, never its target's). Missing dir = 0."""
