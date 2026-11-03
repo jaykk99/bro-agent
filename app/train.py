@@ -17,6 +17,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import threading
 import time
 import uuid
@@ -391,3 +392,73 @@ def adapter_file_path(job_id: str, filename: str, create_dir: bool = False) -> s
         if os.path.commonpath([real_dir, real_root]) != real_root:
             raise ValueError("adapter job dir escapes the adapters directory")
     return os.path.join(d, safe)
+
+
+def open_adapter_file(job_id: str, filename: str) -> tuple[int, int, str]:
+    """Open one adapter file for download, pinned to its inode (no TOCTOU).
+
+    The download route used to check islink/isfile on the path and then
+    hand that path to FileResponse, which opened it later: a symlink
+    swapped in between the check and the open made the route serve the
+    link target outside the adapters tree. This opens the file itself
+    and returns its descriptor, so the caller streams from the inode —
+    a path swap after the open cannot change what is served, and an
+    os.replace() mid-download serves the complete old adapter instead
+    of a half-written new one (matching the upload route's atomicity).
+
+    How the open refuses symlinks, with no check-then-open gap:
+      * the job dir is opened with O_DIRECTORY | O_NOFOLLOW, so a
+        symlinked job dir fails here instead of being followed;
+      * the file is opened by name relative to that dir fd, again with
+        O_NOFOLLOW, so a symlinked file fails instead of being followed;
+      * the result must be a regular file (fstat, not a path check);
+      * on Linux the /proc/self/fd link is re-resolved and must still
+        sit inside the adapters tree, covering a symlinked adapters
+        root itself. Platforms without /proc keep the pre-open realpath
+        check below plus the two O_NOFOLLOW opens, which is no worse
+        than the old route.
+
+    Returns (fd, size_bytes, safe_name). The caller owns the fd and
+    must close it. Raises FileNotFoundError for a missing file/dir, a
+    symlink anywhere in the path, a non-regular file, an in-flight
+    `.upload-*.tmp` name, or a resolved target outside the tree.
+    """
+    if os.path.basename(filename or "").startswith(".upload-"):
+        raise FileNotFoundError("in-flight upload temp files are never servable")
+    dest = adapter_file_path(job_id, filename)
+    job_dir, safe_name = os.path.dirname(dest), os.path.basename(dest)
+    # Pre-open realpath check: the same rule the old route applied after
+    # its symlink check, kept for platforms without /proc.
+    real_root = os.path.realpath(ADAPTERS_DIR)
+    if os.path.commonpath([os.path.realpath(dest), real_root]) != real_root:
+        raise FileNotFoundError("adapter file escapes the adapters directory")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        dir_fd = os.open(
+            job_dir,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow,
+        )
+    except OSError as exc:
+        raise FileNotFoundError("adapter job dir not found") from exc
+    try:
+        fd = os.open(safe_name, os.O_RDONLY | nofollow, dir_fd=dir_fd)
+    except OSError as exc:
+        raise FileNotFoundError("adapter file not found") from exc
+    finally:
+        os.close(dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise FileNotFoundError("adapter file is not a regular file")
+        try:
+            resolved = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            resolved = None
+        if resolved is not None and os.path.commonpath(
+            [os.path.realpath(resolved), real_root]
+        ) != real_root:
+            raise FileNotFoundError("adapter file escapes the adapters directory")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, st.st_size, safe_name

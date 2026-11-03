@@ -699,22 +699,37 @@ async def train_upload(job_id: str, file: UploadFile = File(...), access_code: s
 @app.get("/api/train/{job_id}/files/{filename}")
 def train_file(job_id: str, filename: str, access_code: str = ""):
     _check_access(access_code)
-    # No dir creation here: adapter_file_path used to mkdir on every GET,
-    # so a bogus-job download littered adapters/ with empty directories.
-    # Upload temp files are never servable either: a download naming one
-    # must 404 even if it guesses the unguessable temp name mid-upload.
-    if os.path.basename(filename or "").startswith(".upload-"):
+    # Served from an open file descriptor, not by path (see
+    # train.open_adapter_file): the old code checked islink/isfile on
+    # the path and then handed that path to FileResponse, which opened
+    # it later — a symlink swapped in between the check and the open
+    # made the route serve the link target outside the adapters tree.
+    # The fd pins the inode, so a swap after the open cannot change
+    # what is served, and an os.replace() mid-download serves the
+    # complete old adapter instead of a half-written new one.
+    try:
+        fd, size, safe_name = train_jobs.open_adapter_file(job_id, filename)
+    except (FileNotFoundError, ValueError):
         raise HTTPException(status_code=404, detail="file not found")
-    dest = train_jobs.adapter_file_path(job_id, filename)
-    if _adapter_dest_is_symlink(dest):
-        raise HTTPException(status_code=404, detail="file not found")
-    if os.path.realpath(dest) != dest and os.path.commonpath(
-        [os.path.realpath(dest), os.path.realpath(train_jobs.ADAPTERS_DIR)]
-    ) != os.path.realpath(train_jobs.ADAPTERS_DIR):
-        raise HTTPException(status_code=404, detail="file not found")
-    if not os.path.isfile(dest):
-        raise HTTPException(status_code=404, detail="file not found")
-    return FileResponse(dest)
+
+    def _stream():
+        try:
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            os.close(fd)
+
+    return StreamingResponse(
+        _stream(),
+        media_type="application/octet-stream",
+        headers={
+            "Content-Length": str(size),
+            "Content-Disposition": f'attachment; filename="{safe_name}"',
+        },
+    )
 
 
 class ForgeWorkerRegisterRequest(BaseModel):
