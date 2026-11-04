@@ -40,6 +40,7 @@ import asyncio
 import json
 import logging
 import os
+import stat
 import time
 import uuid
 
@@ -602,12 +603,28 @@ async def train_upload(job_id: str, file: UploadFile = File(...), access_code: s
     # the rejected bytes. And a download running mid-upload served the
     # truncated, half-written file as a complete adapter. Now the upload
     # streams into an unguessable temp file in the same job dir and only
-    # os.replace()s it into place once the whole upload fits under both
+    # renames it into place once the whole upload fits under both
     # caps, so a rejected upload leaves the old file untouched and a
-    # download never sees a partial file. The symlink is re-checked just
-    # before the replace, so a link planted mid-upload is refused rather
-    # than followed — and even without that check, os.replace() swaps
-    # the link itself, never its target.
+    # download never sees a partial file.
+    # Pinned job dir, 2026-11-04: the temp file used to be created by
+    # path (open(tmp) in the job dir) and renamed by path
+    # (os.replace(tmp, dest)), and the symlink re-check just before the
+    # replace only inspected the path at that instant. A job dir swapped
+    # for a symlink after adapter_file_path()'s check — or after that
+    # re-check — made BOTH operations resolve through the link, so the
+    # temp file was created, and the adapter landed, in the link target
+    # outside the adapters tree (the old "replace swaps the link, never
+    # its target" reasoning held for a symlinked FILE, not for a
+    # symlinked DIR, where both paths resolve through the link). Now
+    # the route opens the job dir once with O_DIRECTORY | O_NOFOLLOW
+    # (train.open_adapter_job_dir) and creates, writes, unlinks, and
+    # renames strictly relative to that fd: a path swap after the open
+    # cannot redirect any of them, because none of them re-resolves the
+    # path. The temp create additionally uses O_CREAT | O_EXCL |
+    # O_NOFOLLOW, so a temp name planted as a symlink fails instead of
+    # being followed. The final re-check still refuses a symlinked
+    # destination entry — but even without it, the rename would swap
+    # the entry itself, never its target.
     # Serialization, 2026-11-01: the cap check below snapshots the job's
     # stored bytes before streaming, so two concurrent uploads to one job
     # used to both fit on their own numbers and land over the cap
@@ -630,69 +647,107 @@ async def train_upload(job_id: str, file: UploadFile = File(...), access_code: s
         total_max = _adapter_total_max_bytes()
         base_total = train_jobs.adapter_total_bytes(job_id)
         global_base = train_jobs.adapters_total_bytes()
-        old_size = 0
-        if os.path.isfile(dest) and not os.path.islink(dest):
-            old_size = os.path.getsize(dest)
-            base_total = max(0, base_total - old_size)
-        tmp = os.path.join(
-            os.path.dirname(dest), f".upload-{uuid.uuid4().hex}.tmp"
-        )
-        size = 0
-        token = uuid.uuid4().hex
-        train_jobs.reserve_upload(token, 0)
+        # Pin the job dir before touching anything inside it (see the
+        # pinned-dir comment above): every create, stat, unlink, and
+        # rename below is relative to this fd, never to a path, so a
+        # job-dir symlink swapped in after this point cannot redirect
+        # the upload outside the adapters tree. A swap that already
+        # happened fails here (O_NOFOLLOW) instead of being followed.
         try:
+            dir_fd = train_jobs.open_adapter_job_dir(job_id)
+        except FileNotFoundError:
+            raise HTTPException(status_code=400, detail="adapter path is a symlink, refused")
+        safe_name = os.path.basename(dest)
+        try:
+            old_size = 0
             try:
-                with open(tmp, "wb") as f:
-                    while True:
-                        chunk = await file.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        size += len(chunk)
-                        train_jobs.reserve_upload(token, size)
-                        if (
-                            size > ADAPTER_MAX_BYTES
-                            or base_total + size > job_max
-                            or global_base - old_size + train_jobs.inflight_reserved_bytes() > total_max
-                        ):
-                            raise HTTPException(
-                                status_code=413,
-                                detail=f"adapter file too large ({ADAPTER_MAX_BYTES} byte per-file cap, {job_max} byte per-job cap, {total_max} byte total cap; set BRO_ADAPTER_MAX_BYTES / BRO_ADAPTER_JOB_MAX_BYTES / BRO_ADAPTER_TOTAL_MAX_BYTES to raise them)",
-                            )
-                        f.write(chunk)
-            except BaseException:
-                # Rejected or aborted upload: drop the temp file, leave whatever
-                # was at dest (including a good previous adapter) exactly as is.
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
-            # Final re-check under the cross-job commit lock: the
-            # per-chunk check above reads a snapshot from upload start,
-            # so an upload that landed and released mid-stream would be
-            # invisible to it. Re-scanning here catches that case, and
-            # the lock keeps two racing uploads from both passing and
-            # both landing. A 413 here still drops only the temp file.
-            with train_jobs.adapter_commit_lock():
-                if _adapter_dest_is_symlink(dest):
-                    try:
-                        os.unlink(tmp)
-                    except OSError:
-                        pass
+                dest_st = os.stat(safe_name, dir_fd=dir_fd, follow_symlinks=False)
+            except OSError:
+                dest_st = None
+            if dest_st is not None:
+                if stat.S_ISLNK(dest_st.st_mode) or not stat.S_ISREG(dest_st.st_mode):
                     raise HTTPException(status_code=400, detail="adapter path is a symlink, refused")
-                fresh_total = train_jobs.adapters_total_bytes()
-                if fresh_total - old_size + train_jobs.inflight_reserved_bytes() > total_max:
+                old_size = dest_st.st_size
+                base_total = max(0, base_total - old_size)
+            tmp_name = f".upload-{uuid.uuid4().hex}.tmp"
+            size = 0
+            token = uuid.uuid4().hex
+            train_jobs.reserve_upload(token, 0)
+            try:
+                try:
+                    # O_EXCL: a temp name planted as a symlink (or any
+                    # pre-existing entry) fails instead of being
+                    # followed; O_NOFOLLOW is belt-and-braces on top.
+                    tmp_fd = os.open(
+                        tmp_name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                        dir_fd=dir_fd,
+                    )
+                    with os.fdopen(tmp_fd, "wb") as f:
+                        while True:
+                            chunk = await file.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            size += len(chunk)
+                            train_jobs.reserve_upload(token, size)
+                            if (
+                                size > ADAPTER_MAX_BYTES
+                                or base_total + size > job_max
+                                or global_base - old_size + train_jobs.inflight_reserved_bytes() > total_max
+                            ):
+                                raise HTTPException(
+                                    status_code=413,
+                                    detail=f"adapter file too large ({ADAPTER_MAX_BYTES} byte per-file cap, {job_max} byte per-job cap, {total_max} byte total cap; set BRO_ADAPTER_MAX_BYTES / BRO_ADAPTER_JOB_MAX_BYTES / BRO_ADAPTER_TOTAL_MAX_BYTES to raise them)",
+                                )
+                            f.write(chunk)
+                except BaseException:
+                    # Rejected or aborted upload: drop the temp file, leave whatever
+                    # was at dest (including a good previous adapter) exactly as is.
                     try:
-                        os.unlink(tmp)
+                        os.unlink(tmp_name, dir_fd=dir_fd)
                     except OSError:
                         pass
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"adapter file too large ({ADAPTER_MAX_BYTES} byte per-file cap, {job_max} byte per-job cap, {total_max} byte total cap; set BRO_ADAPTER_MAX_BYTES / BRO_ADAPTER_JOB_MAX_BYTES / BRO_ADAPTER_TOTAL_MAX_BYTES to raise them)",
-                    )
-                os.replace(tmp, dest)
+                    raise
+                # Final re-check under the cross-job commit lock: the
+                # per-chunk check above reads a snapshot from upload start,
+                # so an upload that landed and released mid-stream would be
+                # invisible to it. Re-scanning here catches that case, and
+                # the lock keeps two racing uploads from both passing and
+                # both landing. A 413 here still drops only the temp file.
+                # The destination entry is re-checked relative to the
+                # pinned dir fd, and the rename itself is dir-fd to
+                # dir-fd (POSIX rename replaces the entry, never
+                # follows a symlinked one), so a swap between this
+                # check and the rename is still safe.
+                with train_jobs.adapter_commit_lock():
+                    try:
+                        fresh_st = os.stat(safe_name, dir_fd=dir_fd, follow_symlinks=False)
+                    except OSError:
+                        fresh_st = None
+                    if fresh_st is not None and (
+                        stat.S_ISLNK(fresh_st.st_mode) or not stat.S_ISREG(fresh_st.st_mode)
+                    ):
+                        try:
+                            os.unlink(tmp_name, dir_fd=dir_fd)
+                        except OSError:
+                            pass
+                        raise HTTPException(status_code=400, detail="adapter path is a symlink, refused")
+                    fresh_total = train_jobs.adapters_total_bytes()
+                    if fresh_total - old_size + train_jobs.inflight_reserved_bytes() > total_max:
+                        try:
+                            os.unlink(tmp_name, dir_fd=dir_fd)
+                        except OSError:
+                            pass
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"adapter file too large ({ADAPTER_MAX_BYTES} byte per-file cap, {job_max} byte per-job cap, {total_max} byte total cap; set BRO_ADAPTER_MAX_BYTES / BRO_ADAPTER_JOB_MAX_BYTES / BRO_ADAPTER_TOTAL_MAX_BYTES to raise them)",
+                        )
+                    os.rename(tmp_name, safe_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            finally:
+                train_jobs.release_upload(token)
         finally:
-            train_jobs.release_upload(token)
+            os.close(dir_fd)
     return {"ok": True, "filename": os.path.basename(dest)}
 
 

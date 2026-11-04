@@ -394,6 +394,61 @@ def adapter_file_path(job_id: str, filename: str, create_dir: bool = False) -> s
     return os.path.join(d, safe)
 
 
+def open_adapter_job_dir(job_id: str) -> int:
+    """Open one job's adapter dir pinned to its inode (no TOCTOU).
+
+    The upload route used to create its temp file and os.replace() it
+    into place by path: both operations resolved the job-dir path, so
+    a symlink swapped in after adapter_file_path()'s realpath check
+    (or after the route's pre-replace symlink re-check) made the temp
+    file — and then the landed adapter — resolve through the link to a
+    target outside the adapters tree. The download side was already
+    pinned this way (open_adapter_file); the upload side was not, and
+    the pre-replace check could not close it: it only inspected the
+    path at one instant, while the create and the replace each
+    re-resolved it afterwards.
+
+    This opens the dir itself with O_DIRECTORY | O_NOFOLLOW, so a
+    symlinked job dir fails here instead of being followed, and the
+    caller then creates, writes, and renames strictly relative to the
+    returned fd — a path swap after this open cannot redirect any of
+    those operations, because none of them re-resolves the path. The
+    result must be a directory, and on Linux the /proc/self/fd link is
+    re-resolved and must still sit inside the adapters tree, covering
+    a symlinked adapters root itself (same rule as open_adapter_file).
+
+    Returns the dir fd. The caller owns it and must close it.
+    Raises FileNotFoundError for a missing dir, a symlink anywhere in
+    the path, a non-directory, or a resolved target outside the tree.
+    """
+    d = adapter_job_dir(job_id)
+    real_root = os.path.realpath(ADAPTERS_DIR)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        dir_fd = os.open(
+            d,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow,
+        )
+    except OSError as exc:
+        raise FileNotFoundError("adapter job dir not found") from exc
+    try:
+        st = os.fstat(dir_fd)
+        if not stat.S_ISDIR(st.st_mode):
+            raise FileNotFoundError("adapter job dir is not a directory")
+        try:
+            resolved = os.readlink(f"/proc/self/fd/{dir_fd}")
+        except OSError:
+            resolved = None
+        if resolved is not None and os.path.commonpath(
+            [os.path.realpath(resolved), real_root]
+        ) != real_root:
+            raise FileNotFoundError("adapter job dir escapes the adapters directory")
+    except BaseException:
+        os.close(dir_fd)
+        raise
+    return dir_fd
+
+
 def open_adapter_file(job_id: str, filename: str) -> tuple[int, int, str]:
     """Open one adapter file for download, pinned to its inode (no TOCTOU).
 
