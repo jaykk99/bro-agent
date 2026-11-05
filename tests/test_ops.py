@@ -75,13 +75,36 @@ def test_fail_stuck_jobs():
     r = client.post("/api/train/reap-stuck", json={"access_code": ""})
     assert r.status_code == 200
     assert jid in r.json()["requeued"]
+    assert r.json()["failed"] == []
     job = train.get_job(jid)
     assert job["status"] == "queued"
     assert job["attempts"] == 1
     # fresh working jobs are not touched
     jid2 = train.create_job("m5")
     train.claim_job()
-    assert train.fail_stuck_jobs(max_working_s=3600) == []
+    assert train.fail_stuck_jobs(max_working_s=3600) == {"requeued": [], "failed": []}
+
+
+def test_reap_stuck_fails_exhausted_job():
+    # A stuck job at the attempts cap is failed via the API, not requeued:
+    # the poison job retires instead of cycling forever.
+    _drain_queue()
+    jid = train.create_job("m6")
+    train.claim_job()  # -> working
+    c = train._connect()
+    with train._lock:
+        c.execute(
+            "UPDATE train_jobs SET attempts=?, updated_at=? WHERE id=?",
+            (train.MAX_ATTEMPTS, time.time() - 7200, jid),
+        )
+        c.commit()
+    r = client.post("/api/train/reap-stuck", json={"access_code": ""})
+    assert r.status_code == 200
+    assert jid in r.json()["failed"]
+    assert jid not in r.json()["requeued"]
+    job = train.get_job(jid)
+    assert job["status"] == "failed"
+    assert "needs Jay" in (job["error"] or "")
 
 
 def test_stats_record_and_get():

@@ -96,7 +96,9 @@ Pull-based GPU fine-tuning lives inside bro-agent (no third parties):
 (`notebooks/train-worker.ipynb`) claims it over HTTP, trains with Unsloth
 QLoRA, uploads the LoRA adapter back, wipes its disk. Failed jobs can be
 retried (`/api/train/{id}/retry`, capped at 3 attempts); jobs stuck
-`working` with a vanished worker are re-queued (`/api/train/reap-stuck`).
+`working` with a vanished worker are re-queued (`/api/train/reap-stuck`),
+or failed once they are out of attempts, so a poison job retires instead
+of cycling through workers forever.
 See `TRAIN_PIPELINE.md`.
 
 ## Training jobs and Forge workers

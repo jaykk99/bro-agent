@@ -41,10 +41,13 @@ status, metrics, adapter download  <----  /api/train/{id}/files/adapter_model.sa
 - `GET /api/train/{id}/files/{name}?access_code=` — download an adapter file
 - `POST /api/train/{id}/retry` — re-queue a `failed` job (body: `{access_code}`).
   Attempts are tracked per job and capped at 3 — a poison job stops retrying
-  instead of spinning forever
+  instead of spinning forever. The same cap applies to the automatic paths:
+  a job gets at most 3 re-queues across reap-stuck, the forge reaper, and
+  /retry, and an exhausted job is failed instead of re-queued
 - `POST /api/train/reap-stuck` — re-queue jobs stuck in `working` whose worker
-  vanished (body: `{access_code}`). Covers direct `/api/train/claim` users the
-  forge reaper can't see
+  vanished (body: `{access_code}`), or fail them when they are out of
+  attempts. Returns `{"requeued": [...], "failed": [...]}`. Covers direct
+  `/api/train/claim` users the forge reaper can't see
 
 ## Worker reliability (forge dispatcher)
 
@@ -55,7 +58,11 @@ and sends a heartbeat every 30s carrying its current job id
 `POST /api/forge/workers/{id}/finished`.
 
 If heartbeats stop for 10 minutes, `POST /api/forge/dispatch/reap` marks the
-worker dead and re-queues its stuck job (`working` → `queued`, attempts+1).
+worker dead and re-queues its stuck job (`working` → `queued`, attempts+1) —
+or fails the job if it already used its 3 attempts, so a poison job retires
+instead of cycling through workers forever. `POST /api/train/{id}/complete`
+only accepts a report from the worker holding the job (`working`); a stale
+worker reporting late can no longer overwrite another worker's result.
 The ops dashboard in the UI shows alive/dead workers per platform, queue
 depth, and has reap buttons — or call the endpoints directly.
 

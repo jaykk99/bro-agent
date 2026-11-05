@@ -628,13 +628,15 @@ async function retryJob(id) {
 async function reapStuck() {
   const r = await api("/api/train/reap-stuck", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ access_code: accessCode }) });
   const d = await r.json();
-  alert("re-queued " + (d.requeued || []).length + " stuck job(s)");
+  const failed = (d.failed || []).length;
+  alert("re-queued " + (d.requeued || []).length + " stuck job(s)" + (failed ? ", failed " + failed + " poison job(s) out of attempts" : ""));
   loadOps();
 }
 async function reapWorkers() {
   const r = await api("/api/forge/dispatch/reap", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ access_code: accessCode }) });
   const d = await r.json();
-  alert("reaped " + d.reaped + " worker(s), re-queued " + (d.requeued || []).length + " job(s)");
+  const failed = (d.failed || []).length;
+  alert("reaped " + d.reaped + " worker(s), re-queued " + (d.requeued || []).length + " job(s)" + (failed ? ", failed " + failed + " poison job(s) out of attempts" : ""));
   loadOps();
 }
 </script>

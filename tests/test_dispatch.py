@@ -66,6 +66,39 @@ def test_reap_dead_worker_requeues_stuck_job():
     assert snap["dead"] >= 1
 
 
+def test_reap_dead_worker_retires_poison_job():
+    # A dead worker's job at the attempts cap is failed, not requeued:
+    # before this fix the reaper requeued it forever (requeue_job never
+    # bumped attempts, claim_job never checked them).
+    jid = train.create_job("model-poison-z")
+    claimed = None
+    for _ in range(100):
+        c = train.claim_job()
+        if c is None:
+            break
+        if c["id"] == jid:
+            claimed = c
+            break
+    assert claimed is not None and claimed["status"] == "working"
+    c = train._connect()
+    with train._lock:
+        c.execute(
+            "UPDATE train_jobs SET attempts=? WHERE id=?",
+            (train.MAX_ATTEMPTS, jid),
+        )
+        c.commit()
+    wid = dispatch.register_worker("colab")
+    assert dispatch.heartbeat(wid, jid) is True
+    _backdate_worker(wid, dispatch.HEARTBEAT_TIMEOUT_S + 60)
+    out = dispatch.reap_dead_workers()
+    assert out["reaped"] >= 1
+    assert jid in out["failed"]
+    assert jid not in out["requeued"]
+    job = train.get_job(jid)
+    assert job["status"] == "failed"
+    assert "needs Jay" in (job["error"] or "")
+
+
 def test_reap_skips_jobs_not_working():
     jid = train.create_job("model-y")  # stays queued, not claimed
     wid = dispatch.register_worker("colab")

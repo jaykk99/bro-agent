@@ -24,7 +24,7 @@ Endpoints:
   POST /api/train/claim — worker claims oldest queued job. Body: {access_code}
   POST /api/train/{id}/complete — worker reports done/failed. Body: {access_code, status, ...}
   POST /api/train/{id}/retry — re-queue a failed job (attempts+1, capped). Body: {access_code}
-  POST /api/train/reap-stuck — re-queue 'working' jobs whose worker vanished. Body: {access_code}
+  POST /api/train/reap-stuck — re-queue 'working' jobs whose worker vanished; jobs at the attempts cap fail instead (body: {access_code})
   POST /api/train/{id}/upload — worker uploads adapter file (multipart). Form: {file, access_code}
   GET  /api/train/{id}/files/{name} — download an adapter file (access_code query param)
   POST /api/forge/workers/register — worker registers (platform colab/kaggle). Body: {platform, access_code}
@@ -217,9 +217,14 @@ def train_retry(job_id: str, req: TrainClaimRequest):
 
 @app.post("/api/train/reap-stuck")
 def train_reap_stuck(req: TrainClaimRequest):
-    """Re-queue 'working' jobs whose worker vanished (no worker row needed)."""
+    """Re-queue 'working' jobs whose worker vanished (no worker row needed).
+
+    Returns {"requeued": [...], "failed": [...]}: a stuck job at the
+    attempts cap is failed, not requeued, so a poison job retires instead
+    of cycling claim -> stuck -> requeue forever (see
+    train.fail_stuck_jobs)."""
     _check_access(req.access_code)
-    return {"requeued": train_jobs.fail_stuck_jobs()}
+    return train_jobs.fail_stuck_jobs()
 
 
 UPLOAD_MAX_BYTES = 50 * 1024 * 1024

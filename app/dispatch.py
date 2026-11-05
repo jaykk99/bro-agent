@@ -153,9 +153,15 @@ def status_snapshot() -> dict:
 def reap_dead_workers() -> dict:
     """Mark workers that missed heartbeats as dead; re-queue their stuck jobs.
 
-    Returns {"reaped": <workers marked dead>, "requeued": [job ids put back
-    to 'queued']}. Jobs not in 'working' are never touched.
-    """
+    Returns {"reaped": <workers marked dead>,
+             "requeued": [job ids put back to 'queued'],
+             "failed": [job ids failed at the attempts cap]}. Jobs not in
+    'working' are never touched. A poison job whose worker keeps dying
+    reaches the attempts cap and is failed by requeue_job() instead of
+    requeued — before this fix the reaper requeued it forever, because
+    requeue_job() never bumped attempts and claim_job() never checked
+    them, so each reap just handed the same doomed job to the next
+    worker."""
     from . import train as train_jobs
 
     c = _connect()
@@ -166,13 +172,17 @@ def reap_dead_workers() -> dict:
             (cutoff,),
         ).fetchall()
         requeued: list[str] = []
+        failed: list[str] = []
         for w in stuck:
             jid = w["current_job_id"] or ""
-            if jid and train_jobs.requeue_job(jid):
-                requeued.append(jid)
+            if jid:
+                if train_jobs.requeue_job(jid):
+                    requeued.append(jid)
+                elif (train_jobs.get_job(jid) or {}).get("status") == "failed":
+                    failed.append(jid)
             c.execute(
                 "UPDATE forge_workers SET dead=1, current_job_id='' WHERE id=?",
                 (w["id"],),
             )
         c.commit()
-    return {"reaped": len(stuck), "requeued": requeued}
+    return {"reaped": len(stuck), "requeued": requeued, "failed": failed}

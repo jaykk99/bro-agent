@@ -48,8 +48,33 @@ def test_claim_is_atomic_and_fifo():
     assert first and second  # ids were created
 
 
+def _claim_job_id(jid: str):
+    """Claim jobs until the given id is the one claimed (other queued jobs
+    from earlier tests may be older). Returns the claimed row or None."""
+    for _ in range(100):
+        claimed = train.claim_job()
+        if claimed is None:
+            return None
+        if claimed["id"] == jid:
+            return claimed
+    return None
+
+
+def _backdate_job(jid: str, secs_ago: float = 7200) -> None:
+    import time
+
+    c = train._connect()
+    with train._lock:
+        c.execute(
+            "UPDATE train_jobs SET updated_at=? WHERE id=?",
+            (time.time() - secs_ago, jid),
+        )
+        c.commit()
+
+
 def test_complete_and_metrics():
     jid = train.create_job("model-c")
+    assert _claim_job_id(jid) is not None
     assert train.complete_job(jid, "done", result_url="http://x/a.safetensors",
                               metrics={"train_loss": 1.23}, error="")
     job = train.get_job(jid)
@@ -57,10 +82,114 @@ def test_complete_and_metrics():
     assert job["result_url"] == "http://x/a.safetensors"
     assert job["metrics"]["train_loss"] == 1.23
     jid2 = train.create_job("model-d")
+    assert _claim_job_id(jid2) is not None
     assert train.complete_job(jid2, "failed", error="boom")
     assert train.get_job(jid2)["status"] == "failed"
     assert train.get_job(jid2)["error"] == "boom"
     assert train.complete_job("missing", "done") is False
+
+
+def test_complete_refuses_non_working():
+    # Only the worker holding a job may report on it. A stale worker —
+    # reaped after it vanished, its job re-claimed and finished by
+    # another worker — must not overwrite the new worker's result by
+    # reporting late, and completing a never-claimed job must not flip
+    # it to done.
+    jid = train.create_job("model-stale")
+    assert train.complete_job(jid, "done", result_url="http://x/stale") is False
+    assert train.get_job(jid)["status"] == "queued"
+    assert _claim_job_id(jid) is not None
+    assert train.complete_job(jid, "done", result_url="http://x/real") is True
+    assert train.get_job(jid)["result_url"] == "http://x/real"
+    # Already done: a late duplicate report must not flip it back.
+    assert train.complete_job(jid, "failed", error="late") is False
+    assert train.get_job(jid)["status"] == "done"
+    assert train.get_job(jid)["result_url"] == "http://x/real"
+
+
+def test_requeue_job_bumps_attempts():
+    jid = train.create_job("model-requeue")
+    assert _claim_job_id(jid) is not None
+    assert train.requeue_job(jid) is True
+    job = train.get_job(jid)
+    assert job["status"] == "queued"
+    assert job["attempts"] == 1
+    # A finished job is never requeued.
+    assert _claim_job_id(jid) is not None
+    assert train.complete_job(jid, "done") is True
+    assert train.requeue_job(jid) is False
+
+
+def test_requeue_job_fails_exhausted_job():
+    # A job whose worker already died MAX_ATTEMPTS times is failed, not
+    # handed to yet another worker.
+    jid = train.create_job("model-requeue-poison")
+    assert _claim_job_id(jid) is not None
+    c = train._connect()
+    with train._lock:
+        c.execute(
+            "UPDATE train_jobs SET attempts=? WHERE id=?",
+            (train.MAX_ATTEMPTS, jid),
+        )
+        c.commit()
+    assert train.requeue_job(jid) is False
+    job = train.get_job(jid)
+    assert job["status"] == "failed"
+    assert "needs Jay" in (job["error"] or "")
+
+
+def test_poison_job_fails_after_max_attempts():
+    # Regression: fail_stuck_jobs() requeued every stuck job and
+    # claim_job() ignored attempts, so a job whose worker always died
+    # cycled claim -> stuck -> requeue forever. Now it fails at the cap
+    # and is never claimed again.
+    jid = train.create_job("model-poison")
+    assert _claim_job_id(jid) is not None
+    failed_at = None
+    for _ in range(train.MAX_ATTEMPTS + 2):
+        _backdate_job(jid)
+        out = train.fail_stuck_jobs(max_working_s=3600)
+        job = train.get_job(jid)
+        if job["status"] == "failed":
+            failed_at = out
+            break
+        assert job["status"] == "queued"
+        assert jid in out["requeued"]
+        assert _claim_job_id(jid) is not None
+    assert failed_at is not None, "poison job never failed"
+    assert jid in failed_at["failed"]
+    assert jid not in failed_at["requeued"]
+    job = train.get_job(jid)
+    assert job["status"] == "failed"
+    assert job["attempts"] == train.MAX_ATTEMPTS
+    assert "needs Jay" in (job["error"] or "")
+    # Failed jobs are never claimed, however many times the queue is polled.
+    for _ in range(5):
+        claimed = train.claim_job()
+        assert claimed is None or claimed["id"] != jid
+
+
+def test_job_at_cap_gets_final_run_then_fails():
+    # The cap bounds re-queues, not runs: a job queued at the cap is
+    # still claimable for its final run (the same "3 retries" /retry has
+    # always allowed), and the reap fails it when that run dies instead
+    # of handing it to yet another worker.
+    jid = train.create_job("model-last-run")
+    c = train._connect()
+    with train._lock:
+        c.execute(
+            "UPDATE train_jobs SET attempts=? WHERE id=?",
+            (train.MAX_ATTEMPTS, jid),
+        )
+        c.commit()
+    assert _claim_job_id(jid) is not None
+    _backdate_job(jid)
+    out = train.fail_stuck_jobs(max_working_s=3600)
+    assert jid in out["failed"]
+    assert jid not in out["requeued"]
+    job = train.get_job(jid)
+    assert job["status"] == "failed"
+    assert "needs Jay" in (job["error"] or "")
 
 
 def test_adapter_path_is_traversal_safe():

@@ -29,6 +29,27 @@ _conn: sqlite3.Connection | None = None
 
 ADAPTERS_DIR = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "adapters")
 
+# A job whose worker keeps dying is poison: bad model repo, OOM, poison
+# dataset. Every re-queue path (reap-stuck, forge reaper, manual /retry)
+# bumps attempts, and a job at the cap is failed instead of re-queued —
+# at most MAX_ATTEMPTS re-queues, so a poison job gets MAX_ATTEMPTS + 1
+# runs and then retires instead of burning GPU worker slots forever.
+# The cap is per re-queue, not per run: a job queued at the cap is still
+# claimable for its final run (that is how /retry's "3 retries" has
+# always worked), and the reap fails it when that run dies. Before this
+# fix only retry_job checked the cap, so a poison job cycled
+# claim -> stuck -> requeue -> claim without end through the automatic
+# paths — the "attempts cap stops poison jobs" claim in
+# TRAIN_PIPELINE.md was only true for the manual /retry endpoint.
+MAX_ATTEMPTS = 3
+
+
+def _exhausted_error(attempts: int) -> str:
+    return (
+        f"worker died {attempts} times (max {MAX_ATTEMPTS} attempts); "
+        "needs Jay"
+    )
+
 
 def _connect() -> sqlite3.Connection:
     global _conn
@@ -106,7 +127,12 @@ def list_jobs(limit: int = 50) -> list[dict]:
 
 def claim_job() -> dict | None:
     """Atomically claim the oldest queued job. One statement — first claimer wins,
-    safe across processes/workers."""
+    safe across processes/workers.
+
+    No attempts check here, deliberately: the cap bounds re-queues, not
+    runs, so a job queued at the cap is claimable for its final run (the
+    same "3 retries" the /retry endpoint has always allowed). The reap
+    paths fail the job when that run dies, so it can never cycle again."""
     c = _connect()
     with _lock:
         row = c.execute(
@@ -127,13 +153,19 @@ def complete_job(
     metrics: dict | None = None,
     error: str = "",
 ) -> bool:
+    """Mark a job done/failed. Only a job currently 'working' can complete:
+    the worker that claimed it is the only one whose result counts. A
+    stale worker — reaped after it vanished, its job re-claimed and finished
+    by another worker — used to overwrite the new worker's result (or flip
+    an already-done job back to failed) just by reporting late. Returns
+    False when the job is missing or not 'working'."""
     if status not in ("done", "failed"):
         raise ValueError("status must be done or failed")
     c = _connect()
     with _lock:
         cur = c.execute(
             "UPDATE train_jobs SET status=?, result_url=?, metrics_json=?,"
-            " error=?, updated_at=? WHERE id=?",
+            " error=?, updated_at=? WHERE id=? AND status='working'",
             (
                 status,
                 result_url or None,
@@ -149,18 +181,39 @@ def complete_job(
 
 def requeue_job(job_id: str) -> bool:
     """Move a 'working' job back to 'queued' (its worker died). Returns False
-    if the job is not currently 'working' (finished jobs are never touched)."""
+    if the job is not currently 'working' (finished jobs are never touched).
+
+    Attempts are bumped here, not just in fail_stuck_jobs: the forge
+    reaper calls this directly, and without the bump a poison job would
+    requeue forever through that path too. A job already at the attempts
+    cap is failed instead (its worker kept dying) and this returns False,
+    so callers that report requeued ids never list it as requeued."""
     c = _connect()
     with _lock:
+        row = c.execute(
+            "SELECT status, attempts FROM train_jobs WHERE id=?", (job_id,)
+        ).fetchone()
+        if not row or row["status"] != "working":
+            return False
+        attempts = row["attempts"] or 0
+        if attempts >= MAX_ATTEMPTS:
+            c.execute(
+                "UPDATE train_jobs SET status='failed', error=?, updated_at=?"
+                " WHERE id=?",
+                (_exhausted_error(attempts), time.time(), job_id),
+            )
+            c.commit()
+            return False
         cur = c.execute(
-            "UPDATE train_jobs SET status='queued', updated_at=? WHERE id=? AND status='working'",
+            "UPDATE train_jobs SET status='queued', attempts=attempts+1,"
+            " updated_at=? WHERE id=? AND status='working'",
             (time.time(), job_id),
         )
         c.commit()
         return cur.rowcount > 0
 
 
-def retry_job(job_id: str, max_attempts: int = 3) -> bool:
+def retry_job(job_id: str, max_attempts: int = MAX_ATTEMPTS) -> bool:
     """Retry a failed job: failed -> queued, attempts+1. Refuses when the job
     already hit max_attempts (something is really wrong — needs Jay)."""
     c = _connect()
@@ -181,30 +234,49 @@ def retry_job(job_id: str, max_attempts: int = 3) -> bool:
         return True
 
 
-def fail_stuck_jobs(max_working_s: float = 3600) -> list[str]:
+def fail_stuck_jobs(max_working_s: float = 3600) -> dict:
     """Re-queue 'working' jobs whose worker vanished without completing.
 
     The forge dispatcher reaps dead *workers*; this covers jobs stuck in
     'working' with no worker row at all (e.g. claimed via /api/train/claim
-    directly, then the notebook died). Attempts are bumped so a poison job
-    can't spin forever — retry_job() still caps total attempts.
-    """
+    directly, then the notebook died).
+
+    Returns {"requeued": [ids put back to 'queued'],
+             "failed": [ids failed at the attempts cap]}. A stuck job at
+    the cap is FAILED, not requeued: before this fix every stuck job was
+    requeued with attempts+1 and claim_job() ignored attempts entirely,
+    so a poison job cycled claim -> stuck -> requeue forever — the
+    "attempts cap stops poison jobs" claim in TRAIN_PIPELINE.md was only
+    true for the manual /retry endpoint, never for this automatic path.
+    Attempts are bumped on requeue so a job that keeps dying reaches the
+    cap and retires instead of spinning."""
     c = _connect()
     cutoff = time.time() - max_working_s
+    requeued: list[str] = []
+    failed: list[str] = []
     with _lock:
         stuck = c.execute(
-            "SELECT id FROM train_jobs WHERE status='working' AND updated_at < ?",
+            "SELECT id, attempts FROM train_jobs WHERE status='working' AND updated_at < ?",
             (cutoff,),
         ).fetchall()
-        ids = [r["id"] for r in stuck]
-        if ids:
-            c.execute(
-                "UPDATE train_jobs SET status='queued', attempts=attempts+1,"
-                " updated_at=? WHERE status='working' AND updated_at < ?",
-                (time.time(), cutoff),
-            )
-            c.commit()
-        return ids
+        for r in stuck:
+            attempts = r["attempts"] or 0
+            if attempts >= MAX_ATTEMPTS:
+                c.execute(
+                    "UPDATE train_jobs SET status='failed', error=?,"
+                    " updated_at=? WHERE id=?",
+                    (_exhausted_error(attempts), time.time(), r["id"]),
+                )
+                failed.append(r["id"])
+            else:
+                c.execute(
+                    "UPDATE train_jobs SET status='queued', attempts=attempts+1,"
+                    " updated_at=? WHERE id=? AND status='working'",
+                    (time.time(), r["id"]),
+                )
+                requeued.append(r["id"])
+        c.commit()
+    return {"requeued": requeued, "failed": failed}
 
 
 def count_queued_jobs() -> int:
