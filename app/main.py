@@ -30,13 +30,15 @@ Endpoints:
   POST /api/forge/workers/register — worker registers (platform colab/kaggle). Body: {platform, access_code}
   POST /api/forge/workers/heartbeat — worker heartbeat. Body: {worker_id, current_job_id?, access_code}
   POST /api/forge/workers/{id}/finished — worker reports job done (clears current job). Body: {access_code}
-  GET  /api/forge/workers — dispatcher status: workers alive per platform + queue depth (access_code query param)
+  GET  /api/forge/workers — dispatcher status: workers alive per platform + queue depth + auto-reaper state (access_code query param)
   POST /api/forge/dispatch/reap — reap dead workers, re-queue their stuck jobs. Body: {access_code}
+  (Auto-reaper: a background loop also runs both reaps every BRO_REAP_INTERVAL_S, default 600s; 0 disables. See app/reaper.py.)
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -49,6 +51,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from . import memory
+from . import reaper
 from . import train as train_jobs
 from . import dispatch as forge_dispatch
 from .context import build_window
@@ -61,7 +64,24 @@ from .router import get_router, looks_like_refusal
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="bro-agent")
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start the auto-reaper on boot, stop it on shutdown.
+
+    The reaper loop runs both stuck-job reaps on a timer (see
+    app/reaper.py), so a dead worker's job gets re-queued without anyone
+    remembering to POST the manual reap endpoints. Disabled with
+    BRO_REAP_INTERVAL_S=0. The loop's first pass runs immediately, so a
+    restart clears the backlog instead of waiting out the interval."""
+    reaper.start()
+    try:
+        yield
+    finally:
+        await reaper.stop()
+
+
+app = FastAPI(title="bro-agent", lifespan=lifespan)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "static")
 
@@ -833,7 +853,9 @@ def forge_worker_finished(worker_id: str, req: ForgeWorkerHeartbeatRequest):
 @app.get("/api/forge/workers")
 def forge_workers(access_code: str = ""):
     _check_access(access_code)
-    return forge_dispatch.status_snapshot()
+    snap = forge_dispatch.status_snapshot()
+    snap["reaper"] = reaper.status()
+    return snap
 
 
 @app.post("/api/forge/dispatch/reap")

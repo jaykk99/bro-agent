@@ -66,6 +66,21 @@ worker reporting late can no longer overwrite another worker's result.
 The ops dashboard in the UI shows alive/dead workers per platform, queue
 depth, and has reap buttons — or call the endpoints directly.
 
+## Auto-reaper (background loop)
+
+Reaping used to be manual-only, so a worker that died without notice left
+its job `working` until someone remembered to call reap. The app now runs
+both reaps itself on a timer (`app/reaper.py`, started from the FastAPI
+lifespan): one pass on boot, then every `BRO_REAP_INTERVAL_S` (default
+600s; 0 disables). A pass re-queues `working` jobs whose worker vanished
+and marks dead forge workers dead, re-queuing their stuck jobs; a job at
+the attempts cap (3) is failed instead of re-queued, so a poison job
+retires instead of cycling. `GET /api/forge/workers` reports the reaper
+state (`enabled`, `interval_s`, `running`, `runs`, `last_run_at`,
+`last_result`, `last_error`). The manual endpoints still work unchanged
+and are safe to call alongside the loop — reaping is idempotent, so the
+second caller just finds nothing to do.
+
 ## Why this shape
 
 - **Runs in the app, trains on Colab/Kaggle.** Queue + status + storage live in
