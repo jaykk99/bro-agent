@@ -178,6 +178,27 @@ def test_train_upload_capped_and_partial_file_removed(monkeypatch):
     assert os.path.getsize(train_jobs.adapter_file_path(jid, "adapter_model.safetensors")) == 512
 
 
+def test_train_heartbeat_endpoint():
+    # 404 while the job is merely queued; 200 once it is working; 404
+    # again after it completes (a late heartbeat never revives a job).
+    from app import train as train_jobs
+
+    jid = train_jobs.create_job("Qwen/Qwen2-1.5B")
+    r = client.post(f"/api/train/{jid}/heartbeat", json={"access_code": ""})
+    assert r.status_code == 404
+    for _ in range(100):
+        claimed = train_jobs.claim_job()
+        if claimed is None or claimed["id"] == jid:
+            break
+    assert train_jobs.get_job(jid)["status"] == "working"
+    r = client.post(f"/api/train/{jid}/heartbeat", json={"access_code": ""})
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+    assert train_jobs.complete_job(jid, "done")
+    r = client.post(f"/api/train/{jid}/heartbeat", json={"access_code": ""})
+    assert r.status_code == 404
+
+
 def test_cli_imports():
     import app.cli as cli
 

@@ -3,6 +3,7 @@
 import os
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -197,6 +198,59 @@ def test_adapter_path_is_traversal_safe():
     assert p.endswith("passwd")
     assert ".." not in p
     assert os.path.dirname(p).endswith("abc123")
+
+
+def _claim_specific(jid: str) -> dict:
+    # claim_job takes the oldest queued job; loop until ours is claimed
+    # (other tests may have left queued jobs ahead of it).
+    for _ in range(100):
+        claimed = train.claim_job()
+        if claimed is None:
+            break
+        if claimed["id"] == jid:
+            return claimed
+    raise AssertionError(f"job {jid} was never claimed")
+
+
+def _backdate(jid: str, secs_ago: float) -> None:
+    c = train._connect()
+    with train._lock:
+        c.execute(
+            "UPDATE train_jobs SET updated_at=? WHERE id=?",
+            (time.time() - secs_ago, jid),
+        )
+        c.commit()
+
+
+def test_heartbeat_job_refreshes_updated_at_and_blocks_reap():
+    # The bug: a 30-120 min training run with no heartbeat looks stuck
+    # after 3600s untouched and gets re-queued mid-training. A heartbeat
+    # must refresh updated_at so fail_stuck_jobs leaves it alone.
+    jid = train.create_job("model-hb")
+    _claim_specific(jid)
+    attempts_before = train.get_job(jid)["attempts"]
+    _backdate(jid, 3500)  # nearly stale, but still inside the window
+    assert train.heartbeat_job(jid) is True
+    job = train.get_job(jid)
+    assert job["status"] == "working"
+    assert job["attempts"] == attempts_before  # heartbeat changes nothing else
+    assert time.time() - job["updated_at"] < 5
+    assert train.fail_stuck_jobs()["requeued"] == []
+    assert train.get_job(jid)["status"] == "working"
+    # ...but without a heartbeat the same job IS reaped once it goes stale.
+    _backdate(jid, 3600 + 60)
+    assert jid in train.fail_stuck_jobs()["requeued"]
+    assert train.get_job(jid)["status"] == "queued"
+
+
+def test_heartbeat_job_refuses_non_working_and_missing():
+    jid = train.create_job("model-hb-queued")
+    assert train.heartbeat_job(jid) is False  # queued, not working
+    _claim_specific(jid)
+    assert train.heartbeat_job(jid) is True
+    assert train.complete_job(jid, "done")
+    assert train.heartbeat_job(jid) is False  # done: never revived
+    assert train.heartbeat_job("missing") is False
 
 
 def test_adapter_path_job_id_is_traversal_safe():

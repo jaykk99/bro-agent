@@ -146,6 +146,26 @@ def claim_job() -> dict | None:
     return dict(row) if row else None
 
 
+def heartbeat_job(job_id: str) -> bool:
+    """Touch a 'working' job's updated_at so the reaper knows its worker
+    is still alive. A training run takes 30-120 min but fail_stuck_jobs
+    reaps jobs untouched for 3600s — without this, a legit long run gets
+    re-queued mid-training, a second worker trains it again, and the
+    first worker's eventual complete is refused as stale (its GPU time
+    and adapter upload wasted). The worker notebook calls this from its
+    heartbeat loop while training. Returns False when the job is missing
+    or not 'working': a reaped/finished job must never be revived by a
+    late heartbeat, and the heartbeat never changes status or attempts."""
+    c = _connect()
+    with _lock:
+        cur = c.execute(
+            "UPDATE train_jobs SET updated_at=? WHERE id=? AND status='working'",
+            (time.time(), job_id),
+        )
+        c.commit()
+        return cur.rowcount > 0
+
+
 def complete_job(
     job_id: str,
     status: str,

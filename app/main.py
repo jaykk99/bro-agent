@@ -23,6 +23,7 @@ Endpoints:
   GET  /api/train/{id} — one training job (access_code query param)
   POST /api/train/claim — worker claims oldest queued job. Body: {access_code}
   POST /api/train/{id}/complete — worker reports done/failed. Body: {access_code, status, ...}
+  POST /api/train/{id}/heartbeat — worker liveness ping while training; keeps a long run from being reaped as stuck. Body: {access_code}
   POST /api/train/{id}/retry — re-queue a failed job (attempts+1, capped). Body: {access_code}
   POST /api/train/reap-stuck — re-queue 'working' jobs whose worker vanished; jobs at the attempts cap fail instead (body: {access_code})
   POST /api/train/{id}/upload — worker uploads adapter file (multipart). Form: {file, access_code}
@@ -245,6 +246,19 @@ def train_reap_stuck(req: TrainClaimRequest):
     train.fail_stuck_jobs)."""
     _check_access(req.access_code)
     return train_jobs.fail_stuck_jobs()
+
+
+@app.post("/api/train/{job_id}/heartbeat")
+def train_heartbeat(job_id: str, req: TrainClaimRequest):
+    """Worker liveness ping for a 'working' train job: refreshes updated_at
+    so the reaper does not reap a legit long training run (30-120 min)
+    as stuck. The notebook calls this from its heartbeat loop while
+    training. 404 when the job is missing or not 'working' — a reaped or
+    finished job is never revived by a late heartbeat."""
+    _check_access(req.access_code)
+    if not train_jobs.heartbeat_job(job_id):
+        raise HTTPException(status_code=404, detail="job not found or not working")
+    return {"ok": True}
 
 
 UPLOAD_MAX_BYTES = 50 * 1024 * 1024

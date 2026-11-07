@@ -36,6 +36,7 @@ status, metrics, adapter download  <----  /api/train/{id}/files/adapter_model.sa
 - `GET /api/train/list?access_code=` — recent jobs (newest first, 50 max)
 - `GET /api/train/{id}?access_code=` — one job: status, result_url, metrics, error
 - `POST /api/train/claim` — worker only. Body: `{access_code}` → oldest queued job, atomically marked `working`; 404 when the queue is empty
+- `POST /api/train/{id}/heartbeat` — worker only, while training. Body: `{access_code}` → `{ok}`; refreshes the job's `updated_at` so the reaper does not treat a legit long run as stuck. 404 when the job is missing or not `working` (a late heartbeat never revives a reaped/finished job)
 - `POST /api/train/{id}/complete` — worker only. Body: `{access_code, status: "done"|"failed", result_url?, metrics?, error?}`
 - `POST /api/train/{id}/upload` — worker only. Multipart form: `file` + `access_code`. Filenames are sanitized server-side (path traversal safe). Per-file cap 2 GB by default (413 + partial file removed over the cap); override with `BRO_ADAPTER_MAX_BYTES`
 - `GET /api/train/{id}/files/{name}?access_code=` — download an adapter file
@@ -103,7 +104,9 @@ second caller just finds nothing to do.
 1. Queue: `POST /api/train {"model_repo":"Qwen/Qwen2-1.5B","dataset":"user/my-data","lora_rank":16,"access_code":"..."}` → `{job_id}`.
 2. Worker claims it (atomic), trains (~30–120 min on a T4 for 1–8B models):
    Unsloth 4-bit QLoRA, `use_rslora=True`, cosine schedule, 60 steps default
-   (`TS_MAX_STEPS` env). Dataset auto-formats: Alpaca (`instruction`/`input`/
+   (`TS_MAX_STEPS` env). While training it heartbeats the job every 30s
+   (`POST /api/train/{id}/heartbeat`) so the 60-min stuck-job reaper does
+   not re-queue it mid-run. Dataset auto-formats: Alpaca (`instruction`/`input`/
    `response`) → chat (`messages`) → raw text (first column).
 3. Adapter files (`adapter_model.safetensors`, config, tokenizer) upload to
    bro-agent; job marked `done` with `result_url` + `metrics_json`
@@ -130,6 +133,14 @@ services.
 
 ## Limits (honest)
 
+- **Stuck-job reaping (60 min rule).** A `working` job untouched for 60 min
+  is re-queued (attempts+1) by the auto-reaper, or failed at the attempts
+  cap (3) — so a dead worker's job never blocks the queue. But a training
+  run takes 30–120 min, so the worker MUST heartbeat the job itself
+  (`POST /api/train/{id}/heartbeat`, every 30s from the notebook's heartbeat
+  loop) while training; without it a legit long run is reaped mid-training
+  and a second worker trains it again. The forge worker heartbeat alone
+  does not count — it keeps the worker row alive, not the train job.
 - **Render free-tier disk is ephemeral** — adapters in `data/adapters/` vanish
   on redeploy/restart. Download finished adapters promptly, or point
   `BRO_DB_PATH`/adapters at a persistent disk later. Same for the SQLite DB
