@@ -102,11 +102,15 @@ async def request_log_middleware(request: Request, call_next):
 
     rid = _uuid.uuid4().hex[:8]
     start = time.monotonic()
+    # Pinned before the try: a BaseException (e.g. CancelledError on a
+    # client disconnect mid-request) skips `except Exception`, and the
+    # finally-block log below would crash with UnboundLocalError,
+    # masking the real error. 500 is the honest default for that path.
+    status = 500
     try:
         response = await call_next(request)
         status = response.status_code
     except Exception:
-        status = 500
         raise
     finally:
         ms = (time.monotonic() - start) * 1000
