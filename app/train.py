@@ -71,6 +71,11 @@ def _connect() -> sqlite3.Connection:
             cols = {r["name"] for r in _conn.execute("PRAGMA table_info(train_jobs)").fetchall()}
             if "attempts" not in cols:
                 _conn.execute("ALTER TABLE train_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+            # Migration: older DBs lack the owner column. A job claimed by
+            # a worker records that worker's forge id here (see claim_job)
+            # so only the holder can heartbeat/complete it.
+            if "claimed_by" not in cols:
+                _conn.execute("ALTER TABLE train_jobs ADD COLUMN claimed_by TEXT")
             _conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_train_jobs_status "
                 "ON train_jobs(status, created_at)"
@@ -118,49 +123,78 @@ def list_jobs(limit: int = 50) -> list[dict]:
     c = _connect()
     rows = c.execute(
         "SELECT id, model_repo, dataset, lora_rank, status, result_url,"
-        " metrics_json, error, created_at, updated_at"
+        " metrics_json, error, attempts, claimed_by, created_at, updated_at"
         " FROM train_jobs ORDER BY created_at DESC LIMIT ?",
         (limit,),
     ).fetchall()
     return [_row_to_dict(r) for r in rows]
 
 
-def claim_job() -> dict | None:
+def _owner_clause(worker_id: str = "") -> tuple[str, str]:
+    """SQL predicate + bound value enforcing job ownership.
+
+    A job claimed with a worker id is owned by that worker: only its
+    heartbeat/complete calls count. A job claimed without one (direct
+    /api/train/claim users, old notebooks) has no owner and any caller
+    may report on it, as before. The predicate lives in the UPDATE
+    itself, so the check and the write are one atomic statement — a
+    pre-check in the route only picks the error code, it is not the
+    enforcement."""
+    owner = (worker_id or "").strip()[:64]
+    return "(claimed_by IS NULL OR claimed_by='' OR claimed_by=?)", owner
+
+
+def claim_job(worker_id: str = "") -> dict | None:
     """Atomically claim the oldest queued job. One statement — first claimer wins,
     safe across processes/workers.
 
     No attempts check here, deliberately: the cap bounds re-queues, not
     runs, so a job queued at the cap is claimable for its final run (the
     same "3 retries" the /retry endpoint has always allowed). The reap
-    paths fail the job when that run dies, so it can never cycle again."""
+    paths fail the job when that run dies, so it can never cycle again.
+
+    The claim records its worker (the notebook's forge worker id) in
+    claimed_by, so heartbeat_job/complete_job can refuse a stale worker
+    that reports on a job another worker now holds. Before this, the
+    "only the holding worker may report" claim in TRAIN_PIPELINE.md was
+    only half true: complete_job checked status='working', which stops a
+    late report on a FINISHED job but not a stale worker completing a
+    job another worker is still training — the stale report marked the
+    job done and the real worker's GPU run and adapter upload were
+    wasted. A claim without a worker id stays unowned (back-compat)."""
     c = _connect()
+    owner = (worker_id or "").strip()[:64] or None
     with _lock:
         row = c.execute(
-            "UPDATE train_jobs SET status='working', updated_at=? "
+            "UPDATE train_jobs SET status='working', claimed_by=?, updated_at=? "
             "WHERE id = (SELECT id FROM train_jobs WHERE status='queued'"
             " ORDER BY created_at ASC LIMIT 1) "
-            "RETURNING id, model_repo, dataset, lora_rank, status, created_at, updated_at",
-            (time.time(),),
+            "RETURNING id, model_repo, dataset, lora_rank, status, attempts,"
+            " claimed_by, created_at, updated_at",
+            (owner, time.time()),
         ).fetchone()
         c.commit()
     return dict(row) if row else None
 
 
-def heartbeat_job(job_id: str) -> bool:
+def heartbeat_job(job_id: str, worker_id: str = "") -> bool:
     """Touch a 'working' job's updated_at so the reaper knows its worker
     is still alive. A training run takes 30-120 min but fail_stuck_jobs
     reaps jobs untouched for 3600s — without this, a legit long run gets
     re-queued mid-training, a second worker trains it again, and the
     first worker's eventual complete is refused as stale (its GPU time
     and adapter upload wasted). The worker notebook calls this from its
-    heartbeat loop while training. Returns False when the job is missing
-    or not 'working': a reaped/finished job must never be revived by a
-    late heartbeat, and the heartbeat never changes status or attempts."""
+    heartbeat loop while training. Returns False when the job is missing,
+    not 'working', or held by another worker: a reaped/finished job must
+    never be revived by a late heartbeat, and the heartbeat never changes
+    status or attempts."""
+    clause, owner = _owner_clause(worker_id)
     c = _connect()
     with _lock:
         cur = c.execute(
-            "UPDATE train_jobs SET updated_at=? WHERE id=? AND status='working'",
-            (time.time(), job_id),
+            "UPDATE train_jobs SET updated_at=? WHERE id=? AND status='working'"
+            f" AND {clause}",
+            (time.time(), job_id, owner),
         )
         c.commit()
         return cur.rowcount > 0
@@ -172,20 +206,25 @@ def complete_job(
     result_url: str = "",
     metrics: dict | None = None,
     error: str = "",
+    worker_id: str = "",
 ) -> bool:
     """Mark a job done/failed. Only a job currently 'working' can complete:
     the worker that claimed it is the only one whose result counts. A
     stale worker — reaped after it vanished, its job re-claimed and finished
     by another worker — used to overwrite the new worker's result (or flip
     an already-done job back to failed) just by reporting late. Returns
-    False when the job is missing or not 'working'."""
+    False when the job is missing, not 'working', or held by another
+    worker (pass that worker's id as worker_id; an unowned job accepts
+    any reporter, as before)."""
     if status not in ("done", "failed"):
         raise ValueError("status must be done or failed")
+    clause, owner = _owner_clause(worker_id)
     c = _connect()
     with _lock:
         cur = c.execute(
             "UPDATE train_jobs SET status=?, result_url=?, metrics_json=?,"
-            " error=?, updated_at=? WHERE id=? AND status='working'",
+            " error=?, updated_at=? WHERE id=? AND status='working'"
+            f" AND {clause}",
             (
                 status,
                 result_url or None,
@@ -193,6 +232,7 @@ def complete_job(
                 (error or "")[:2000] or None,
                 time.time(),
                 job_id,
+                owner,
             ),
         )
         c.commit()
@@ -207,7 +247,9 @@ def requeue_job(job_id: str) -> bool:
     reaper calls this directly, and without the bump a poison job would
     requeue forever through that path too. A job already at the attempts
     cap is failed instead (its worker kept dying) and this returns False,
-    so callers that report requeued ids never list it as requeued."""
+    so callers that report requeued ids never list it as requeued. The
+    old owner is cleared either way: the next claim starts unowned until
+    its worker records itself."""
     c = _connect()
     with _lock:
         row = c.execute(
@@ -218,15 +260,15 @@ def requeue_job(job_id: str) -> bool:
         attempts = row["attempts"] or 0
         if attempts >= MAX_ATTEMPTS:
             c.execute(
-                "UPDATE train_jobs SET status='failed', error=?, updated_at=?"
-                " WHERE id=?",
+                "UPDATE train_jobs SET status='failed', error=?, claimed_by=NULL,"
+                " updated_at=? WHERE id=?",
                 (_exhausted_error(attempts), time.time(), job_id),
             )
             c.commit()
             return False
         cur = c.execute(
             "UPDATE train_jobs SET status='queued', attempts=attempts+1,"
-            " updated_at=? WHERE id=? AND status='working'",
+            " claimed_by=NULL, updated_at=? WHERE id=? AND status='working'",
             (time.time(), job_id),
         )
         c.commit()
@@ -247,7 +289,7 @@ def retry_job(job_id: str, max_attempts: int = MAX_ATTEMPTS) -> bool:
             return False
         c.execute(
             "UPDATE train_jobs SET status='queued', attempts=attempts+1,"
-            " error=NULL, updated_at=? WHERE id=?",
+            " claimed_by=NULL, error=NULL, updated_at=? WHERE id=?",
             (time.time(), job_id),
         )
         c.commit()
@@ -284,14 +326,14 @@ def fail_stuck_jobs(max_working_s: float = 3600) -> dict:
             if attempts >= MAX_ATTEMPTS:
                 c.execute(
                     "UPDATE train_jobs SET status='failed', error=?,"
-                    " updated_at=? WHERE id=?",
+                    " claimed_by=NULL, updated_at=? WHERE id=?",
                     (_exhausted_error(attempts), time.time(), r["id"]),
                 )
                 failed.append(r["id"])
             else:
                 c.execute(
                     "UPDATE train_jobs SET status='queued', attempts=attempts+1,"
-                    " updated_at=? WHERE id=? AND status='working'",
+                    " claimed_by=NULL, updated_at=? WHERE id=? AND status='working'",
                     (time.time(), r["id"]),
                 )
                 requeued.append(r["id"])

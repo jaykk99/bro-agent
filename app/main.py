@@ -21,9 +21,12 @@ Endpoints:
   POST /api/train   — queue a fine-tune job. Body: {model_repo, dataset?, lora_rank?, access_code}
   GET  /api/train/list — recent training jobs (access_code query param)
   GET  /api/train/{id} — one training job (access_code query param)
-  POST /api/train/claim — worker claims oldest queued job. Body: {access_code}
-  POST /api/train/{id}/complete — worker reports done/failed. Body: {access_code, status, ...}
-  POST /api/train/{id}/heartbeat — worker liveness ping while training; keeps a long run from being reaped as stuck. Body: {access_code}
+  POST /api/train/claim — worker claims oldest queued job. Body: {access_code, worker_id?}
+                     The claim records the worker id as the job's owner; heartbeat/complete
+                     then refuse any other worker (409) so a stale worker can't report on
+                     a job another worker now holds. A claim without worker_id stays unowned.
+  POST /api/train/{id}/complete — worker reports done/failed. Body: {access_code, status, worker_id?, ...}
+  POST /api/train/{id}/heartbeat — worker liveness ping while training; keeps a long run from being reaped as stuck. Body: {access_code, worker_id?}
   POST /api/train/{id}/retry — re-queue a failed job (attempts+1, capped). Body: {access_code}
   POST /api/train/reap-stuck — re-queue 'working' jobs whose worker vanished; jobs at the attempts cap fail instead (body: {access_code})
   POST /api/train/{id}/upload — worker uploads adapter file (multipart). Form: {file, access_code}
@@ -31,6 +34,8 @@ Endpoints:
   POST /api/forge/workers/register — worker registers (platform colab/kaggle). Body: {platform, access_code}
   POST /api/forge/workers/heartbeat — worker heartbeat. Body: {worker_id, current_job_id?, access_code}
   POST /api/forge/workers/{id}/finished — worker reports job done (clears current job). Body: {access_code}
+                     404 for an unknown or reaped (dead) worker id — a dead worker never
+                     revives; it must re-register for a fresh id.
   GET  /api/forge/workers — dispatcher status: workers alive per platform + queue depth + auto-reaper state (access_code query param)
   POST /api/forge/dispatch/reap — reap dead workers, re-queue their stuck jobs. Body: {access_code}
   (Auto-reaper: a background loop also runs both reaps every BRO_REAP_INTERVAL_S, default 600s; 0 disables. See app/reaper.py.)
@@ -144,6 +149,7 @@ class TrainCreateRequest(BaseModel):
 
 class TrainClaimRequest(BaseModel):
     access_code: str = ""
+    worker_id: str = ""
 
 
 class TrainCompleteRequest(BaseModel):
@@ -152,6 +158,20 @@ class TrainCompleteRequest(BaseModel):
     result_url: str = ""
     metrics: dict = {}
     error: str = ""
+    worker_id: str = ""
+
+
+def _check_job_owner(job_id: str, worker_id: str) -> None:
+    """404 when the job is missing or not 'working'; 409 when it is held
+    by another worker. This only picks the error code — the ownership
+    check that matters lives in the UPDATE inside train.heartbeat_job /
+    train.complete_job, so the check and the write stay atomic."""
+    job = train_jobs.get_job(job_id)
+    if not job or job["status"] != "working":
+        raise HTTPException(status_code=404, detail="job not found or not working")
+    owner = (job.get("claimed_by") or "")
+    if owner and (worker_id or "").strip() != owner:
+        raise HTTPException(status_code=409, detail="job is held by another worker")
 
 
 @app.get("/api/health")
@@ -258,9 +278,11 @@ def train_heartbeat(job_id: str, req: TrainClaimRequest):
     so the reaper does not reap a legit long training run (30-120 min)
     as stuck. The notebook calls this from its heartbeat loop while
     training. 404 when the job is missing or not 'working' — a reaped or
-    finished job is never revived by a late heartbeat."""
+    finished job is never revived by a late heartbeat. 409 when the job
+    is held by another worker."""
     _check_access(req.access_code)
-    if not train_jobs.heartbeat_job(job_id):
+    _check_job_owner(job_id, req.worker_id)
+    if not train_jobs.heartbeat_job(job_id, req.worker_id):
         raise HTTPException(status_code=404, detail="job not found or not working")
     return {"ok": True}
 
@@ -602,7 +624,7 @@ def train_claim(req: TrainClaimRequest, request: Request):
         rate_limit.check(f"claim:{ip}")
     except rate_limit.RateLimited:
         raise HTTPException(status_code=429, detail="claim too often", headers={"Retry-After": "5"})
-    job = train_jobs.claim_job()
+    job = train_jobs.claim_job(req.worker_id)
     if not job:
         raise HTTPException(status_code=404, detail="no queued jobs")
     return job
@@ -613,7 +635,8 @@ def train_complete(job_id: str, req: TrainCompleteRequest):
     _check_access(req.access_code)
     if req.status not in ("done", "failed"):
         raise HTTPException(status_code=400, detail="status must be done or failed")
-    ok = train_jobs.complete_job(job_id, req.status, req.result_url, req.metrics or None, req.error)
+    _check_job_owner(job_id, req.worker_id)
+    ok = train_jobs.complete_job(job_id, req.status, req.result_url, req.metrics or None, req.error, req.worker_id)
     if not ok:
         raise HTTPException(status_code=404, detail="job not found")
     return {"ok": True}
@@ -863,8 +886,8 @@ def forge_worker_heartbeat(req: ForgeWorkerHeartbeatRequest):
 @app.post("/api/forge/workers/{worker_id}/finished")
 def forge_worker_finished(worker_id: str, req: ForgeWorkerHeartbeatRequest):
     _check_access(req.access_code)
-    forge_dispatch.job_finished(worker_id)
-    forge_dispatch.heartbeat(worker_id, "")
+    if not forge_dispatch.job_finished(worker_id):
+        raise HTTPException(status_code=404, detail="unknown worker_id")
     return {"ok": True}
 
 

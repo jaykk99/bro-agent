@@ -33,11 +33,11 @@ status, metrics, adapter download  <----  /api/train/{id}/files/adapter_model.sa
 ## Endpoints (all behind the access-code gate)
 
 - `POST /api/train` — queue a job. Body: `{model_repo, dataset?, lora_rank? (1-256, default 16), access_code}` → `{job_id}`
-- `GET /api/train/list?access_code=` — recent jobs (newest first, 50 max)
-- `GET /api/train/{id}?access_code=` — one job: status, result_url, metrics, error
-- `POST /api/train/claim` — worker only. Body: `{access_code}` → oldest queued job, atomically marked `working`; 404 when the queue is empty
-- `POST /api/train/{id}/heartbeat` — worker only, while training. Body: `{access_code}` → `{ok}`; refreshes the job's `updated_at` so the reaper does not treat a legit long run as stuck. 404 when the job is missing or not `working` (a late heartbeat never revives a reaped/finished job)
-- `POST /api/train/{id}/complete` — worker only. Body: `{access_code, status: "done"|"failed", result_url?, metrics?, error?}`
+- `GET /api/train/list?access_code=` — recent jobs (newest first, 50 max), each with `attempts` and `claimed_by` (holding worker id, or null)
+- `GET /api/train/{id}?access_code=` — one job: status, result_url, metrics, error, attempts, claimed_by
+- `POST /api/train/claim` — worker only. Body: `{access_code, worker_id?}` → oldest queued job, atomically marked `working`; 404 when the queue is empty. The claim records `worker_id` as the job's owner (`claimed_by`); heartbeat/complete then refuse any other worker with 409, so a stale worker can't report on a job another worker now holds. A claim without `worker_id` stays unowned (direct-claim users, old notebooks) and any reporter may complete it, as before.
+- `POST /api/train/{id}/heartbeat` — worker only, while training. Body: `{access_code, worker_id?}` → `{ok}`; refreshes the job's `updated_at` so the reaper does not treat a legit long run as stuck. 404 when the job is missing or not `working` (a late heartbeat never revives a reaped/finished job); 409 when the job is held by another worker
+- `POST /api/train/{id}/complete` — worker only. Body: `{access_code, status: "done"|"failed", result_url?, metrics?, error?, worker_id?}`. 404 when the job is missing or not `working`; 409 when the job is held by another worker
 - `POST /api/train/{id}/upload` — worker only. Multipart form: `file` + `access_code`. Filenames are sanitized server-side (path traversal safe). Per-file cap 2 GB by default (413 + partial file removed over the cap); override with `BRO_ADAPTER_MAX_BYTES`
 - `GET /api/train/{id}/files/{name}?access_code=` — download an adapter file
 - `POST /api/train/{id}/retry` — re-queue a `failed` job (body: `{access_code}`).
@@ -61,7 +61,11 @@ and sends a heartbeat every 30s carrying its current job id
 If heartbeats stop for 10 minutes, `POST /api/forge/dispatch/reap` marks the
 worker dead and re-queues its stuck job (`working` → `queued`, attempts+1) —
 or fails the job if it already used its 3 attempts, so a poison job retires
-instead of cycling through workers forever. `POST /api/train/{id}/complete`
+instead of cycling through workers forever. A dead worker id never revives:
+if the runtime wakes up after being reaped, its heartbeat is refused and it
+must re-register for a fresh id (the notebook does this automatically) —
+reviving it would restore its stale job id and the next reap would re-queue
+the new holder's job. `POST /api/train/{id}/complete`
 only accepts a report from the worker holding the job (`working`); a stale
 worker reporting late can no longer overwrite another worker's result.
 The ops dashboard in the UI shows alive/dead workers per platform, queue

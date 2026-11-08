@@ -578,9 +578,10 @@ async function loadOps() {
   try {
     const jobs = await (await api("/api/train/list" + q)).json();
     const list = jobs.jobs || [];
-    $("ops-jobs").innerHTML = list.length ? `<table><tr><th>job</th><th>model</th><th>status</th><th>attempts</th><th></th></tr>` +
+    $("ops-jobs").innerHTML = list.length ? `<table><tr><th>job</th><th>model</th><th>status</th><th>attempts</th><th>worker</th><th></th></tr>` +
       list.slice(0, 20).map(j => `<tr><td>${j.id.slice(0, 8)}</td><td>${esc(j.model_repo || "")}</td>` +
         `<td><span class="pill ${j.status}">${j.status}</span></td><td>${j.attempts || 0}</td>` +
+        `<td>${j.claimed_by ? esc(j.claimed_by.slice(0, 8)) : "&mdash;"}</td>` +
         `<td>${j.status === "failed" ? `<button class="mini-btn" onclick="retryJob('${j.id}')">retry</button>` : ""}</td></tr>`).join("") + `</table>`
       : `<div class="ops-empty">no train jobs yet</div>`;
   } catch (e) { $("ops-jobs").innerHTML = `<div class="ops-empty">failed to load</div>`; }

@@ -311,3 +311,76 @@ def test_adapter_total_bytes():
         f.write(b"y" * 50)
     assert train.adapter_total_bytes(jid) == 150
     assert train.adapter_total_bytes("no-such-job-xyz") == 0
+
+
+def _claim_job_id_as(jid: str, worker_id: str = ""):
+    """Claim jobs as one worker until the given id is the one claimed."""
+    for _ in range(100):
+        claimed = train.claim_job(worker_id)
+        if claimed is None:
+            return None
+        if claimed["id"] == jid:
+            return claimed
+    return None
+
+
+def test_claim_records_owner_and_enforces_it():
+    # A stale worker that reports on a job another worker now holds must
+    # not complete it (or keep it alive): the claim stamps the owner.
+    jid = train.create_job("model-owner")
+    claimed = _claim_job_id_as(jid, "worker-a")
+    assert claimed is not None
+    assert claimed["claimed_by"] == "worker-a"
+    assert train.get_job(jid)["claimed_by"] == "worker-a"
+    # A different worker's report is refused, job untouched.
+    assert train.complete_job(jid, "done", result_url="http://x/stale") is False
+    assert train.complete_job(jid, "done", worker_id="worker-b") is False
+    assert train.heartbeat_job(jid, "worker-b") is False
+    job = train.get_job(jid)
+    assert job["status"] == "working"
+    assert job["result_url"] is None
+    # The owner can heartbeat and complete.
+    assert train.heartbeat_job(jid, "worker-a") is True
+    assert train.complete_job(jid, "done", result_url="http://x/real",
+                              worker_id="worker-a") is True
+    assert train.get_job(jid)["result_url"] == "http://x/real"
+
+
+def test_unowned_claim_stays_open():
+    # Claims without a worker id (direct /api/train/claim users, old
+    # notebooks) have no owner: any reporter may heartbeat/complete,
+    # exactly as before this change.
+    jid = train.create_job("model-unowned")
+    assert _claim_job_id_as(jid) is not None
+    assert train.get_job(jid)["claimed_by"] in (None, "")
+    assert train.heartbeat_job(jid) is True
+    assert train.heartbeat_job(jid, "whoever") is True
+    assert train.complete_job(jid, "done", worker_id="whoever") is True
+    assert train.get_job(jid)["status"] == "done"
+
+
+def test_requeue_clears_owner():
+    jid = train.create_job("model-requeue-owner")
+    assert _claim_job_id_as(jid, "worker-a") is not None
+    assert train.requeue_job(jid) is True
+    job = train.get_job(jid)
+    assert job["status"] == "queued"
+    assert job["claimed_by"] in (None, "")
+    # Re-claimed by a different worker: the new owner is enforced, and
+    # the old owner is now a stranger.
+    assert _claim_job_id_as(jid, "worker-b") is not None
+    assert train.complete_job(jid, "done", worker_id="worker-a") is False
+    assert train.complete_job(jid, "done", worker_id="worker-b") is True
+
+
+def test_list_jobs_includes_attempts_and_claimed_by():
+    # Regression: the ops UI renders j.attempts, but list_jobs never
+    # selected it, so the column always showed 0.
+    jid = train.create_job("model-list-owner")
+    assert _claim_job_id_as(jid, "worker-a") is not None
+    assert train.requeue_job(jid) is True  # attempts 1, owner cleared
+    assert _claim_job_id_as(jid, "worker-c") is not None
+    row = next(j for j in train.list_jobs() if j["id"] == jid)
+    assert row["attempts"] == 1
+    assert row["claimed_by"] == "worker-c"
+    assert train.complete_job(jid, "done", worker_id="worker-c") is True

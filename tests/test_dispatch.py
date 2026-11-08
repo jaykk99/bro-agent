@@ -172,3 +172,56 @@ if __name__ == "__main__":
             fn()
             print(f"{name}: OK")
     print("ALL DISPATCH TESTS PASS")
+
+
+def test_dead_worker_heartbeat_does_not_revive():
+    # A reaped worker that wakes up must not silently come back to life:
+    # the old heartbeat cleared dead=0 on any check-in, which also
+    # restored its stale current_job_id — and the next reap then
+    # re-queued the NEW holder's job.
+    jid = train.create_job("model-revive")
+    claimed = None
+    for _ in range(100):
+        c = train.claim_job()
+        if c is None:
+            break
+        if c["id"] == jid:
+            claimed = c
+            break
+    assert claimed is not None and claimed["status"] == "working"
+    wid = dispatch.register_worker("colab")
+    assert dispatch.heartbeat(wid, jid) is True
+    _backdate_worker(wid, dispatch.HEARTBEAT_TIMEOUT_S + 60)
+    out = dispatch.reap_dead_workers()
+    assert jid in out["requeued"]
+    assert train.get_job(jid)["status"] == "queued"
+    # The runtime wakes up and heartbeats with its stale job id: refused.
+    assert dispatch.heartbeat(wid, jid) is False
+    assert dispatch.job_finished(wid) is False
+    snap = dispatch.status_snapshot()
+    by_id = {w["id"]: w for w in snap["workers"]}
+    assert by_id[wid]["status"] == "dead"
+    assert by_id[wid]["current_job_id"] is None
+    assert train.get_job(jid)["status"] == "queued"
+    # A new worker claims the re-queued job; the dead worker's refused
+    # heartbeat must not get the new holder's job re-queued on the
+    # next reap.
+    claimed = None
+    for _ in range(100):
+        c = train.claim_job()
+        if c is None:
+            break
+        if c["id"] == jid:
+            claimed = c
+            break
+    assert claimed is not None
+    wid_b = dispatch.register_worker("kaggle")
+    assert dispatch.heartbeat(wid_b, jid) is True
+    assert dispatch.heartbeat(wid, jid) is False  # stale id still refused
+    out2 = dispatch.reap_dead_workers()
+    assert jid not in out2["requeued"]
+    assert train.get_job(jid)["status"] == "working"
+    # A fresh registration works and is a different id.
+    wid2 = dispatch.register_worker("colab")
+    assert wid2 != wid
+    assert dispatch.heartbeat(wid2, "") is True

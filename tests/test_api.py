@@ -204,3 +204,68 @@ def test_cli_imports():
 
     assert callable(cli.chat_stream)
     assert cli.BASE.startswith("http")
+
+
+def test_train_claim_records_owner_and_complete_409s_non_owner():
+    # End to end: claim with a worker id, then a stranger's heartbeat /
+    # complete is 409, the owner's is 200, and /api/train/list shows the
+    # attempts + claimed_by the ops UI renders.
+    from app import train as train_jobs
+
+    rate_limit.reset_for_tests()
+    jid = train_jobs.create_job("Qwen/Qwen2-1.5B")
+    claimed = None
+    for _ in range(10):
+        r = client.post("/api/train/claim", json={"access_code": "", "worker_id": "worker-a"})
+        assert r.status_code == 200, r.text
+        if r.json()["id"] == jid:
+            claimed = r.json()
+            break
+    assert claimed is not None
+    assert claimed["claimed_by"] == "worker-a"
+    r = client.post(f"/api/train/{jid}/heartbeat", json={"access_code": "", "worker_id": "worker-b"})
+    assert r.status_code == 409
+    r = client.post(f"/api/train/{jid}/heartbeat", json={"access_code": "", "worker_id": "worker-a"})
+    assert r.status_code == 200
+    r = client.post(f"/api/train/{jid}/complete",
+                    json={"access_code": "", "status": "done", "worker_id": "worker-b"})
+    assert r.status_code == 409
+    assert train_jobs.get_job(jid)["status"] == "working"
+    r = client.post(f"/api/train/{jid}/complete",
+                    json={"access_code": "", "status": "done", "worker_id": "worker-a"})
+    assert r.status_code == 200
+    assert train_jobs.get_job(jid)["status"] == "done"
+    rows = client.get("/api/train/list?access_code=").json()["jobs"]
+    row = next(j for j in rows if j["id"] == jid)
+    assert row["attempts"] == 0
+    assert row["claimed_by"] == "worker-a"
+
+
+def test_forge_heartbeat_404s_dead_worker():
+    # A reaped worker's id is dead: heartbeat and finished both 404, so
+    # the worker re-registers instead of silently reviving.
+    import time
+
+    from app import dispatch as forge_dispatch
+
+    wid = forge_dispatch.register_worker("colab")
+    assert client.post("/api/forge/workers/heartbeat",
+                       json={"worker_id": wid, "access_code": ""}).status_code == 200
+    c = forge_dispatch._connect()
+    with forge_dispatch._lock:
+        c.execute(
+            "UPDATE forge_workers SET last_seen=? WHERE id=?",
+            (time.time() - forge_dispatch.HEARTBEAT_TIMEOUT_S - 60, wid),
+        )
+        c.commit()
+    r = client.post("/api/forge/dispatch/reap", json={"access_code": ""})
+    assert r.status_code == 200
+    assert r.json()["reaped"] >= 1
+    r = client.post("/api/forge/workers/heartbeat",
+                    json={"worker_id": wid, "access_code": ""})
+    assert r.status_code == 404
+    r = client.post(f"/api/forge/workers/{wid}/finished", json={"access_code": ""})
+    assert r.status_code == 404
+    snap = client.get("/api/forge/workers?access_code=").json()
+    by_id = {w["id"]: w for w in snap["workers"]}
+    assert by_id[wid]["status"] == "dead"

@@ -68,9 +68,22 @@ def register_worker(platform: str = "") -> str:
 
 
 def heartbeat(worker_id: str, current_job_id: str = "") -> bool:
-    """Worker check-in. Returns False for an unknown worker_id."""
+    """Worker check-in. Returns False for an unknown worker_id — and for
+    a DEAD one. A reaped worker that wakes up (a Colab runtime resumed
+    after its job was re-queued to someone else) must re-register for a
+    fresh id instead of silently reviving: the old code cleared dead=0
+    on any heartbeat, which also restored the worker's stale
+    current_job_id — and the next reap then re-queued the NEW holder's
+    job, because requeue_job only checks that the job is 'working'. A
+    dead id stays dead; the notebook re-registers when its heartbeat
+    is refused (see notebooks/train-worker.ipynb)."""
     c = _connect()
     with _lock:
+        row = c.execute(
+            "SELECT dead FROM forge_workers WHERE id=?", (worker_id,)
+        ).fetchone()
+        if not row or row["dead"]:
+            return False
         cur = c.execute(
             "UPDATE forge_workers SET last_seen=?, current_job_id=?, dead=0 WHERE id=?",
             (time.time(), (current_job_id or "").strip(), worker_id),
