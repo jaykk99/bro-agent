@@ -29,7 +29,11 @@ Endpoints:
   POST /api/train/{id}/heartbeat — worker liveness ping while training; keeps a long run from being reaped as stuck. Body: {access_code, worker_id?}
   POST /api/train/{id}/retry — re-queue a failed job (attempts+1, capped). Body: {access_code}
   POST /api/train/reap-stuck — re-queue 'working' jobs whose worker vanished; jobs at the attempts cap fail instead (body: {access_code})
-  POST /api/train/{id}/upload — worker uploads adapter file (multipart). Form: {file, access_code}
+  POST /api/train/{id}/upload — worker uploads adapter file (multipart). Form: {file, access_code, sha256?}
+                     The streamed bytes are hashed server-side; a worker-supplied sha256 that
+                     mismatches is a 422 and the file is not stored. The verified hash is
+                     recorded on the job (GET shows it as adapter_files) and sent back on
+                     download as the X-Adapter-Sha256 header.
   GET  /api/train/{id}/files/{name} — download an adapter file (access_code query param)
   POST /api/forge/workers/register — worker registers (platform colab/kaggle). Body: {platform, access_code}
   POST /api/forge/workers/heartbeat — worker heartbeat. Body: {worker_id, current_job_id?, access_code}
@@ -45,9 +49,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
+import re
 import stat
 import time
 import uuid
@@ -643,10 +649,34 @@ def train_complete(job_id: str, req: TrainCompleteRequest):
 
 
 @app.post("/api/train/{job_id}/upload")
-async def train_upload(job_id: str, file: UploadFile = File(...), access_code: str = Form("")):
+async def train_upload(
+    job_id: str,
+    file: UploadFile = File(...),
+    access_code: str = Form(""),
+    sha256: str = Form(""),
+):
+    """Worker uploads one adapter file (multipart).
+
+    Integrity, 2026-11-09: the route used to store whatever bytes
+    arrived with no check at all, so a truncated or corrupted upload
+    (flaky Colab connection, worker-side partial file) landed as a
+    good adapter and only failed when Jay tried to load it. The route
+    now hashes the streamed bytes itself, and when the worker sends
+    its own sha256 (the notebook does — see notebooks/train-worker.ipynb)
+    a mismatch is a 422 and the file is NOT stored: the temp file is
+    dropped and any previous good adapter at that name is untouched,
+    exactly like a 413. The verified hash is recorded on the job
+    (train.record_adapter_file) and surfaced on GET /api/train/{id}
+    as `adapter_files` and on download as the X-Adapter-Sha256 header,
+    so a downloader can verify what it got. No sha256 sent (old
+    notebooks) still stores the file — the server-computed hash is
+    recorded either way, so only the mismatch refusal is new."""
     _check_access(access_code)
     if not train_jobs.get_job(job_id):
         raise HTTPException(status_code=404, detail="job not found")
+    expected_sha = (sha256 or "").strip().lower()
+    if expected_sha and not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+        raise HTTPException(status_code=400, detail="sha256 must be 64 lowercase hex chars")
     try:
         dest = train_jobs.adapter_file_path(job_id, file.filename or "adapter.bin", create_dir=True)
     except ValueError:
@@ -737,6 +767,7 @@ async def train_upload(job_id: str, file: UploadFile = File(...), access_code: s
                 base_total = max(0, base_total - old_size)
             tmp_name = f".upload-{uuid.uuid4().hex}.tmp"
             size = 0
+            digest = hashlib.sha256()
             token = uuid.uuid4().hex
             train_jobs.reserve_upload(token, 0)
             try:
@@ -756,6 +787,7 @@ async def train_upload(job_id: str, file: UploadFile = File(...), access_code: s
                             if not chunk:
                                 break
                             size += len(chunk)
+                            digest.update(chunk)
                             train_jobs.reserve_upload(token, size)
                             if (
                                 size > ADAPTER_MAX_BYTES
@@ -767,6 +799,16 @@ async def train_upload(job_id: str, file: UploadFile = File(...), access_code: s
                                     detail=f"adapter file too large ({ADAPTER_MAX_BYTES} byte per-file cap, {job_max} byte per-job cap, {total_max} byte total cap; set BRO_ADAPTER_MAX_BYTES / BRO_ADAPTER_JOB_MAX_BYTES / BRO_ADAPTER_TOTAL_MAX_BYTES to raise them)",
                                 )
                             f.write(chunk)
+                    # Integrity: the streamed bytes must hash to what the
+                    # worker claimed. Raised inside this try so the
+                    # except below drops the temp file and the old
+                    # adapter at this name (if any) survives untouched.
+                    actual_sha = digest.hexdigest()
+                    if expected_sha and actual_sha != expected_sha:
+                        raise HTTPException(
+                            status_code=422,
+                            detail=f"sha256 mismatch: uploaded bytes hash {actual_sha}, expected {expected_sha}; file not stored",
+                        )
                 except BaseException:
                     # Rejected or aborted upload: drop the temp file, leave whatever
                     # was at dest (including a good previous adapter) exactly as is.
@@ -810,11 +852,20 @@ async def train_upload(job_id: str, file: UploadFile = File(...), access_code: s
                             detail=f"adapter file too large ({ADAPTER_MAX_BYTES} byte per-file cap, {job_max} byte per-job cap, {total_max} byte total cap; set BRO_ADAPTER_MAX_BYTES / BRO_ADAPTER_JOB_MAX_BYTES / BRO_ADAPTER_TOTAL_MAX_BYTES to raise them)",
                         )
                     os.rename(tmp_name, safe_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                    # Landed: record the verified hash against the job so
+                    # GET /api/train/{id} and the download header can
+                    # prove these are the bytes the worker sent.
+                    train_jobs.record_adapter_file(job_id, safe_name, digest.hexdigest(), size)
             finally:
                 train_jobs.release_upload(token)
         finally:
             os.close(dir_fd)
-    return {"ok": True, "filename": os.path.basename(dest)}
+    return {
+        "ok": True,
+        "filename": os.path.basename(dest),
+        "sha256": digest.hexdigest(),
+        "bytes": size,
+    }
 
 
 @app.get("/api/train/{job_id}/files/{filename}")
@@ -843,13 +894,25 @@ def train_file(job_id: str, filename: str, access_code: str = ""):
         finally:
             os.close(fd)
 
+    # Advertise the hash recorded at upload time, so a downloader can
+    # verify the bytes it received. Files uploaded before hashes were
+    # recorded (or by old notebooks without a hash — the server still
+    # records its own computed hash) simply carry no header.
+    headers: dict[str, str] = {
+        "Content-Length": str(size),
+        "Content-Disposition": f'attachment; filename="{safe_name}"',
+    }
+    job = train_jobs.get_job(job_id)
+    if job:
+        for entry in job.get("adapter_files") or []:
+            if entry.get("name") == safe_name and entry.get("sha256"):
+                headers["X-Adapter-Sha256"] = entry["sha256"]
+                break
+
     return StreamingResponse(
         _stream(),
         media_type="application/octet-stream",
-        headers={
-            "Content-Length": str(size),
-            "Content-Disposition": f'attachment; filename="{safe_name}"',
-        },
+        headers=headers,
     )
 
 

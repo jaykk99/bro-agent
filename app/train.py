@@ -76,6 +76,12 @@ def _connect() -> sqlite3.Connection:
             # so only the holder can heartbeat/complete it.
             if "claimed_by" not in cols:
                 _conn.execute("ALTER TABLE train_jobs ADD COLUMN claimed_by TEXT")
+            # Migration: older DBs lack the adapter-hashes column. The
+            # upload route records a sha256 per stored adapter file here
+            # (see record_adapter_file) so a download can be verified
+            # against what the worker actually trained.
+            if "adapter_hashes_json" not in cols:
+                _conn.execute("ALTER TABLE train_jobs ADD COLUMN adapter_hashes_json TEXT")
             _conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_train_jobs_status "
                 "ON train_jobs(status, created_at)"
@@ -91,6 +97,28 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
             d["metrics"] = json.loads(d["metrics_json"])
         except Exception:
             d["metrics"] = None
+    # Verified adapter files: {name: {"sha256": ..., "bytes": ...}} stored
+    # by record_adapter_file() at upload time. Surfaced as a sorted list
+    # so GET /api/train/{id} (and the ops UI) can show what landed and
+    # a downloader can verify it. Corrupt/partial JSON degrades to [].
+    d["adapter_files"] = []
+    raw_hashes = d.pop("adapter_hashes_json", None)
+    if raw_hashes:
+        try:
+            parsed = json.loads(raw_hashes)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            for name in sorted(parsed):
+                entry = parsed[name]
+                if isinstance(entry, dict) and entry.get("sha256"):
+                    d["adapter_files"].append(
+                        {
+                            "name": name,
+                            "sha256": entry["sha256"],
+                            "bytes": int(entry.get("bytes") or 0),
+                        }
+                    )
     return d
 
 
@@ -123,7 +151,8 @@ def list_jobs(limit: int = 50) -> list[dict]:
     c = _connect()
     rows = c.execute(
         "SELECT id, model_repo, dataset, lora_rank, status, result_url,"
-        " metrics_json, error, attempts, claimed_by, created_at, updated_at"
+        " metrics_json, error, attempts, claimed_by, adapter_hashes_json,"
+        " created_at, updated_at"
         " FROM train_jobs ORDER BY created_at DESC LIMIT ?",
         (limit,),
     ).fetchall()
@@ -346,6 +375,37 @@ def count_queued_jobs() -> int:
     c = _connect()
     row = c.execute("SELECT COUNT(*) FROM train_jobs WHERE status='queued'").fetchone()
     return int(row[0]) if row else 0
+
+
+def record_adapter_file(job_id: str, filename: str, sha256_hex: str, size: int) -> None:
+    """Record the verified sha256 + size of one stored adapter file.
+
+    Called by the upload route after the file has landed (and after the
+    optional worker-supplied hash was verified against the streamed
+    bytes). A re-upload of the same name replaces the entry, so the
+    record always describes the bytes currently on disk. No-op for an
+    unknown job id. The map lives in adapter_hashes_json and is
+    surfaced by _row_to_dict() as `adapter_files`."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(filename or ""))[:128] or "file"
+    c = _connect()
+    with _lock:
+        row = c.execute(
+            "SELECT adapter_hashes_json FROM train_jobs WHERE id=?", (job_id,)
+        ).fetchone()
+        if not row:
+            return
+        try:
+            data = json.loads(row["adapter_hashes_json"]) if row["adapter_hashes_json"] else {}
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data[safe] = {"sha256": sha256_hex, "bytes": int(size)}
+        c.execute(
+            "UPDATE train_jobs SET adapter_hashes_json=?, updated_at=? WHERE id=?",
+            (json.dumps(data, sort_keys=True), time.time(), job_id),
+        )
+        c.commit()
 
 
 def adapter_job_dir(job_id: str) -> str:

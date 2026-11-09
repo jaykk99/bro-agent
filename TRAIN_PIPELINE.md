@@ -38,7 +38,7 @@ status, metrics, adapter download  <----  /api/train/{id}/files/adapter_model.sa
 - `POST /api/train/claim` — worker only. Body: `{access_code, worker_id?}` → oldest queued job, atomically marked `working`; 404 when the queue is empty. The claim records `worker_id` as the job's owner (`claimed_by`); heartbeat/complete then refuse any other worker with 409, so a stale worker can't report on a job another worker now holds. A claim without `worker_id` stays unowned (direct-claim users, old notebooks) and any reporter may complete it, as before.
 - `POST /api/train/{id}/heartbeat` — worker only, while training. Body: `{access_code, worker_id?}` → `{ok}`; refreshes the job's `updated_at` so the reaper does not treat a legit long run as stuck. 404 when the job is missing or not `working` (a late heartbeat never revives a reaped/finished job); 409 when the job is held by another worker
 - `POST /api/train/{id}/complete` — worker only. Body: `{access_code, status: "done"|"failed", result_url?, metrics?, error?, worker_id?}`. 404 when the job is missing or not `working`; 409 when the job is held by another worker
-- `POST /api/train/{id}/upload` — worker only. Multipart form: `file` + `access_code`. Filenames are sanitized server-side (path traversal safe). Per-file cap 2 GB by default (413 + partial file removed over the cap); override with `BRO_ADAPTER_MAX_BYTES`
+- `POST /api/train/{id}/upload` — worker only. Multipart form: `file` + `access_code` (+ optional `sha256`). Filenames are sanitized server-side (path traversal safe). Per-file cap 2 GB by default (413 + partial file removed over the cap); override with `BRO_ADAPTER_MAX_BYTES`. Integrity: the route hashes the streamed bytes itself; a worker-supplied `sha256` that mismatches is a 422 and the file is NOT stored (any previous good adapter at that name survives, like a 413). The verified hash is recorded on the job and shown by `GET /api/train/{id}` as `adapter_files` (`[{name, sha256, bytes}]`), and the download route sends it as the `X-Adapter-Sha256` header, so a downloader can verify what it got. The notebook sends the hash and streams the file (never loads a whole adapter into RAM); old notebooks that send no hash still work — the server-computed hash is recorded either way.
 - `GET /api/train/{id}/files/{name}?access_code=` — download an adapter file
 - `POST /api/train/{id}/retry` — re-queue a `failed` job (body: `{access_code}`).
   Attempts are tracked per job and capped at 3 — a poison job stops retrying
@@ -113,7 +113,10 @@ second caller just finds nothing to do.
    not re-queue it mid-run. Dataset auto-formats: Alpaca (`instruction`/`input`/
    `response`) → chat (`messages`) → raw text (first column).
 3. Adapter files (`adapter_model.safetensors`, config, tokenizer) upload to
-   bro-agent; job marked `done` with `result_url` + `metrics_json`
+   bro-agent; each file is sha256-verified against the hash the worker
+   computed before sending (mismatch = 422, file not stored), and the
+   verified hash is recorded on the job. Job marked `done` with
+   `result_url` + `metrics_json`
    (`{train_loss, examples, max_steps, lora_rank}`), or `failed` with `error`.
 4. Worker wipes its local job dir and CUDA cache.
 5. Poll `GET /api/train/{id}` for status; download the adapter from
