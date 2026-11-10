@@ -174,6 +174,92 @@ if __name__ == "__main__":
     print("ALL DISPATCH TESTS PASS")
 
 
+def _backdate_job(jid: str, secs_ago: float) -> None:
+    c = train._connect()
+    with train._lock:
+        c.execute(
+            "UPDATE train_jobs SET updated_at=? WHERE id=?",
+            (time.time() - secs_ago, jid),
+        )
+        c.commit()
+
+
+def test_forge_heartbeat_keeps_train_job_alive():
+    # A worker checking in ONLY through the forge heartbeat (the
+    # documented worker check-in, carrying its current job id) must
+    # keep its train job alive: a run takes 30-120 min but
+    # fail_stuck_jobs reaps 'working' jobs untouched for 3600s. Before
+    # this fix only the worker row was refreshed here, so the job was
+    # re-queued mid-training and a second worker claimed it, wasting
+    # the first worker's GPU run (its complete was then refused as
+    # stale). The notebook worked around it with a second ping to
+    # /api/train/{id}/heartbeat; this endpoint is now sufficient alone.
+    jid = train.create_job("model-forge-hb-alive")
+    wid = dispatch.register_worker("colab")
+    claimed = None
+    for _ in range(100):
+        c = train.claim_job(wid)
+        if c is None:
+            break
+        if c["id"] == jid:
+            claimed = c
+            break
+    assert claimed is not None and claimed["status"] == "working"
+    assert train.get_job(jid)["claimed_by"] == wid
+    # Simulate a long run: job untouched for over the reap threshold.
+    _backdate_job(jid, 3600 + 400)
+    assert dispatch.heartbeat(wid, jid) is True  # forge check-in only
+    out = train.fail_stuck_jobs()
+    assert jid not in out["requeued"]
+    assert train.get_job(jid)["status"] == "working"
+
+
+def test_forge_heartbeat_does_not_refresh_job_held_by_another_worker():
+    # The train-job touch is ownership-enforced: worker B heartbeating
+    # with a job worker A owns must NOT keep A's job alive, or a stale
+    # worker could pin a job it no longer holds and block the reaper.
+    jid = train.create_job("model-forge-hb-other")
+    wid_a = dispatch.register_worker("colab")
+    claimed = None
+    for _ in range(100):
+        c = train.claim_job(wid_a)
+        if c is None:
+            break
+        if c["id"] == jid:
+            claimed = c
+            break
+    assert claimed is not None and claimed["status"] == "working"
+    _backdate_job(jid, 3600 + 400)
+    wid_b = dispatch.register_worker("kaggle")
+    assert dispatch.heartbeat(wid_b, jid) is True  # B's worker row is live
+    out = train.fail_stuck_jobs()
+    assert jid in out["requeued"]
+    assert train.get_job(jid)["status"] == "queued"
+
+
+def test_forge_heartbeat_does_not_revive_finished_job():
+    # A heartbeat carrying a finished job's id must never change it:
+    # the touch only refreshes jobs still 'working'.
+    jid = train.create_job("model-forge-hb-done")
+    wid = dispatch.register_worker("colab")
+    claimed = None
+    for _ in range(100):
+        c = train.claim_job(wid)
+        if c is None:
+            break
+        if c["id"] == jid:
+            claimed = c
+            break
+    assert claimed is not None
+    assert train.complete_job(jid, "done", worker_id=wid) is True
+    assert dispatch.heartbeat(wid, jid) is True
+    job = train.get_job(jid)
+    assert job["status"] == "done"
+    out = train.fail_stuck_jobs()
+    assert jid not in out["requeued"]
+    assert train.get_job(jid)["status"] == "done"
+
+
 def test_dead_worker_heartbeat_does_not_revive():
     # A reaped worker that wakes up must not silently come back to life:
     # the old heartbeat cleared dead=0 on any check-in, which also

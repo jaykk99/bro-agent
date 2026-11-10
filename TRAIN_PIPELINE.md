@@ -146,8 +146,13 @@ services.
   run takes 30–120 min, so the worker MUST heartbeat the job itself
   (`POST /api/train/{id}/heartbeat`, every 30s from the notebook's heartbeat
   loop) while training; without it a legit long run is reaped mid-training
-  and a second worker trains it again. The forge worker heartbeat alone
-  does not count — it keeps the worker row alive, not the train job.
+  and a second worker trains it again. Since 2026-11-10 the forge worker
+  heartbeat (`POST /api/forge/workers/heartbeat` with `current_job_id`)
+  refreshes the train job too, so a worker checking in only through the
+  forge endpoint no longer loses its run — the notebook's separate train
+  ping is redundant but harmless back-compat for old servers. The touch
+  is ownership-enforced: a heartbeat from a worker that does not own the
+  job never refreshes it.
 - **Render free-tier disk is ephemeral** — adapters in `data/adapters/` vanish
   on redeploy/restart. Download finished adapters promptly, or point
   `BRO_DB_PATH`/adapters at a persistent disk later. Same for the SQLite DB

@@ -76,7 +76,26 @@ def heartbeat(worker_id: str, current_job_id: str = "") -> bool:
     current_job_id — and the next reap then re-queued the NEW holder's
     job, because requeue_job only checks that the job is 'working'. A
     dead id stays dead; the notebook re-registers when its heartbeat
-    is refused (see notebooks/train-worker.ipynb)."""
+    is refused (see notebooks/train-worker.ipynb).
+
+    A live check-in also keeps the worker's current train job alive:
+    the forge heartbeat carries current_job_id, and a training run
+    takes 30-120 min while fail_stuck_jobs reaps 'working' jobs
+    untouched for 3600s — before this fix only the worker row was
+    refreshed here, so a worker checking in ONLY through this endpoint
+    (the documented worker check-in) had its job re-queued mid-training
+    and a second worker claimed it, wasting the first worker's GPU run
+    and adapter upload (its eventual complete was refused as stale).
+    The notebook worked around it by ALSO pinging
+    /api/train/{id}/heartbeat, but the server has everything it needs
+    right here, so this endpoint is now sufficient on its own. The
+    touch goes through train.heartbeat_job, which only refreshes a job
+    that is still 'working' AND owned by this worker — a stale worker
+    heartbeating with a job another worker now holds cannot keep that
+    job alive, and a reaped/finished job is never revived. A False
+    there is ignored: the worker heartbeat itself already succeeded."""
+    from . import train as train_jobs
+
     c = _connect()
     with _lock:
         row = c.execute(
@@ -89,7 +108,10 @@ def heartbeat(worker_id: str, current_job_id: str = "") -> bool:
             (time.time(), (current_job_id or "").strip(), worker_id),
         )
         c.commit()
-        return cur.rowcount > 0
+        ok = cur.rowcount > 0
+    if ok and (current_job_id or "").strip():
+        train_jobs.heartbeat_job((current_job_id or "").strip(), worker_id)
+    return ok
 
 
 def job_finished(worker_id: str) -> bool:
