@@ -86,6 +86,11 @@ Threads: list / messages / rename / delete / Markdown export. `GET /api/threads`
 Models: `GET /api/models` (chain health), `GET /api/stats` (usage counts).
 Uploads: `POST /api/upload` (into `workdir/uploads/`), `GET /api/uploads` (list),
 `DELETE /api/uploads/{name}` (delete) — also shown in the ops dashboard.
+Work files: `GET /api/files` (browse the agent workdir, `?path=` subdir, dirs first),
+`GET /api/files/download?path=` (download one workdir file),
+`DELETE /api/files?path=` (delete one workdir file) — the ops dashboard has a
+Work files panel with drill-down, download, and delete, so files the agent
+writes can be retrieved without a terminal.
 Terminal: `python -m app.cli` — `/new /threads /thread <id> /rename <title> /delete /export [path] /quit`.
 Training + forge worker endpoints: see the module docstring in `app/main.py`.
 

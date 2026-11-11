@@ -18,6 +18,9 @@ Endpoints:
   POST /api/upload  — upload a file into workdir/uploads/. Form: {file, access_code}
   GET  /api/uploads — list uploaded files (name, bytes, mtime)
   DELETE /api/uploads/{name} — delete one uploaded file
+  GET  /api/files — browse the agent workdir (?path= subdir, default root)
+  GET  /api/files/download — download one workdir file (?path=, fd-pinned)
+  DELETE /api/files — delete one workdir file (?path=, regular files only)
   POST /api/train   — queue a fine-tune job. Body: {model_repo, dataset?, lora_rank?, access_code}
   GET  /api/train/list — recent training jobs (access_code query param)
   GET  /api/train/{id} — one training job (access_code query param)
@@ -375,6 +378,107 @@ def uploads_list(access_code: str = ""):
                 st = os.stat(path)
                 items.append({"name": entry, "bytes": st.st_size, "mtime": st.st_mtime})
     return {"uploads": items}
+
+
+@app.get("/api/files")
+def work_files_list(path: str = "", access_code: str = ""):
+    """Browse the agent's workdir: one directory, non-recursive.
+
+    `path` is a workdir-relative subdir ("" = the workdir root). The
+    agent's output lands here — reports, scripts, downloads — and until
+    this endpoint existed there was no way to see it without a terminal.
+    Paths are jailed by workfiles.list_dir (sandbox.resolve), so `..`
+    escapes and symlinks pointing outside the workdir are refused."""
+    from .sandbox import SandboxViolation, workdir
+    from . import workfiles
+
+    _check_access(access_code)
+    root = workdir()
+    try:
+        entries = workfiles.list_dir(root, path)
+    except SandboxViolation:
+        raise HTTPException(status_code=400, detail="path escapes workdir")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="directory not found")
+    except NotADirectoryError:
+        raise HTTPException(status_code=400, detail="path is a file, not a directory")
+    return {"path": (path or "").strip().strip("/"), "entries": entries}
+
+
+@app.get("/api/files/download")
+def work_file_download(path: str = "", access_code: str = ""):
+    """Download one workdir file, streamed from a pinned fd.
+
+    Served from an open file descriptor, not by path (see
+    workfiles.open_work_file): the fd pins the inode, so a symlink
+    swapped in after the check cannot change what is served, and a
+    replace mid-download serves the complete old file instead of a
+    half-written new one — the same pattern as the train adapter
+    download."""
+    from .sandbox import SandboxViolation, workdir
+    from . import workfiles
+
+    _check_access(access_code)
+    if not (path or "").strip():
+        raise HTTPException(status_code=400, detail="path is required")
+    root = workdir()
+    try:
+        fd, size, name = workfiles.open_work_file(root, path)
+    except SandboxViolation:
+        raise HTTPException(status_code=400, detail="path escapes workdir")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="file not found")
+    except IsADirectoryError:
+        raise HTTPException(status_code=400, detail="path is a directory, not a file")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="not a regular file")
+
+    def _stream():
+        try:
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            os.close(fd)
+
+    return StreamingResponse(
+        _stream(),
+        media_type="application/octet-stream",
+        headers={
+            "Content-Length": str(size),
+            "Content-Disposition": f'attachment; filename="{name}"',
+        },
+    )
+
+
+@app.delete("/api/files")
+def work_file_delete(path: str = "", access_code: str = ""):
+    """Delete one regular workdir file (agent output cleanup).
+
+    Directories are never deleted here — use the agent or the terminal
+    for those. The unlink goes through a pinned parent dir fd (see
+    workfiles.delete_work_file), so a swapped-in symlink is unlinked
+    as an entry, never followed to its target."""
+    from .sandbox import SandboxViolation, workdir
+    from . import workfiles
+
+    _check_access(access_code)
+    if not (path or "").strip():
+        raise HTTPException(status_code=400, detail="path is required")
+    root = workdir()
+    try:
+        name = workfiles.delete_work_file(root, path)
+    except SandboxViolation:
+        raise HTTPException(status_code=400, detail="path escapes workdir")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="file not found")
+    except IsADirectoryError:
+        raise HTTPException(status_code=400, detail="path is a directory, not a file")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="not a regular file")
+    return {"ok": True, "name": name}
 
 
 @app.delete("/api/uploads/{name}")

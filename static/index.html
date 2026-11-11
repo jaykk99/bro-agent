@@ -206,6 +206,10 @@
         <h3>Uploads <span><button class="mini-btn" onclick="loadOps()">refresh</button></span></h3>
         <div id="ops-uploads"><div class="ops-empty">loading…</div></div>
       </div>
+      <div class="ops-card">
+        <h3>Work files <span><button class="mini-btn" onclick="loadWorkFiles('')">refresh</button></span></h3>
+        <div id="ops-files"><div class="ops-empty">loading…</div></div>
+      </div>
     </div>
   </div>
 </div>
@@ -611,9 +615,45 @@ async function loadOps() {
     $("ops-uploads").innerHTML = files.length ? `<table><tr><th>file</th><th>size</th><th>modified</th><th></th></tr>` +
       files.map(f => `<tr><td>${esc(f.name)}</td><td>${(f.bytes / 1024).toFixed(1)} KB</td>` +
         `<td>${new Date(f.mtime * 1000).toLocaleString()}</td>` +
-        `<td><button class="mini-btn" onclick="deleteUpload(${JSON.stringify(f.name)})">delete</button></td></tr>`).join("") + `</table>`
+        `<td><a class="mini-btn" href="/api/files/download?path=${encodeURIComponent("uploads/" + f.name)}&access_code=${encodeURIComponent(accessCode)}">download</a> ` +
+        `<button class="mini-btn" onclick="deleteUpload(${JSON.stringify(f.name)})">delete</button></td></tr>`).join("") + `</table>`
       : `<div class="ops-empty">no uploads yet</div>`;
   } catch (e) { $("ops-uploads").innerHTML = `<div class="ops-empty">failed to load</div>`; }
+  loadWorkFiles("");
+}
+let workFilesPath = "";
+async function loadWorkFiles(path) {
+  workFilesPath = path || "";
+  const q = "?access_code=" + encodeURIComponent(accessCode) + "&path=" + encodeURIComponent(workFilesPath);
+  try {
+    const r = await api("/api/files" + q);
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || r.status);
+    const crumbs = workFilesPath ? `<a href="#" onclick="loadWorkFiles('');return false">workdir</a> / ` +
+      workFilesPath.split("/").map((part, i, arr) =>
+        i === arr.length - 1 ? esc(part)
+        : `<a href="#" onclick="loadWorkFiles(${JSON.stringify(arr.slice(0, i + 1).join("/"))});return false">${esc(part)}</a>`).join(" / ") : "workdir";
+    const rows = (d.entries || []).map(e => {
+      const cell = e.is_dir
+        ? `<a href="#" onclick="loadWorkFiles(${JSON.stringify(e.path)});return false">${esc(e.name)}/</a>`
+        : esc(e.name);
+      const size = e.is_dir ? "&mdash;" : (e.bytes / 1024).toFixed(1) + " KB";
+      const actions = e.is_dir ? "" :
+        `<a class="mini-btn" href="/api/files/download?path=${encodeURIComponent(e.path)}&access_code=${encodeURIComponent(accessCode)}">download</a> ` +
+        `<button class="mini-btn" onclick="deleteWorkFile(${JSON.stringify(e.path)})">delete</button>`;
+      return `<tr><td>${cell}</td><td>${size}</td><td>${new Date(e.mtime * 1000).toLocaleString()}</td><td>${actions}</td></tr>`;
+    }).join("");
+    $("ops-files").innerHTML = `<div style="margin-bottom:6px">${crumbs}</div>` +
+      (rows ? `<table><tr><th>name</th><th>size</th><th>modified</th><th></th></tr>${rows}</table>`
+        : `<div class="ops-empty">empty directory</div>`);
+  } catch (e) { $("ops-files").innerHTML = `<div class="ops-empty">failed to load</div>`; }
+}
+async function deleteWorkFile(path) {
+  if (!confirm("Delete work file " + path + "?")) return;
+  const q = "?access_code=" + encodeURIComponent(accessCode) + "&path=" + encodeURIComponent(path);
+  const r = await api("/api/files" + q, { method: "DELETE" });
+  if (!r.ok) alert("delete failed: " + r.status);
+  loadWorkFiles(workFilesPath);
 }
 async function deleteUpload(name) {
   if (!confirm("Delete upload " + name + "?")) return;

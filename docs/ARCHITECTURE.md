@@ -59,6 +59,7 @@ app/main.py ──┬── access-code gate, rate limit, hard-boundary pre-chec
 | `train.py` | `train_jobs` | fine-tune job queue (queued/working/done/failed, attempts) |
 | `dispatch.py` | `forge_workers` | Colab/Kaggle worker registry + heartbeats |
 | `stats.py` | `chat_stats` | per-day/per-provider turn counts |
+| `workfiles.py` | (filesystem) | browse/download/delete agent output in the workdir (`/api/files*`) |
 
 `BRO_DB_PATH` overrides the location (default `./data/bro.db`).
 
