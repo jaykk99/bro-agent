@@ -137,12 +137,16 @@ on persistent disks; Render free-tier disk is ephemeral.
 ## Tests
 
 ```bash
+pip install -r requirements.txt
 pip install pytest httpx
-python -m pytest tests/ -q --ignore=tests/test_horde.py
+python -m pytest tests/ -q
 ```
 
-`tests/test_horde.py` needs `langchain_core` installed (production dep);
-everything else runs dependency-free thanks to the `app/tool_base.py` shim.
+The full suite runs dependency-free apart from the production
+requirements (`langchain_core` comes in via `langchain-openai`) plus
+pytest/httpx, so `tests/test_horde.py` runs with the rest — no skips.
+CI (`.github/workflows/ci.yml`) runs the same command on every push
+and pull request to main.
 
 ## Live URL
 
