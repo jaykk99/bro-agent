@@ -1,0 +1,22 @@
+{
+  "n": 13,
+  "n_positive": 10,
+  "n_negative": 3,
+  "threshold": 0.5,
+  "test_acc": 0.8461538461538461,
+  "accuracy": 0.8461538461538461,
+  "majority_baseline_accuracy": 0.7692307692307693,
+  "auc": 0.7666666666666667,
+  "confusion": {
+    "tp": 10,
+    "fp": 2,
+    "tn": 1,
+    "fn": 0
+  },
+  "per_class_recall": {
+    "touches_tests": 1.0,
+    "no_tests": 0.3333333333333333
+  },
+  "precision_touches_tests": 0.8333333333333334,
+  "precision_no_tests": 1.0
+}

@@ -1,0 +1,40 @@
+name: nn-100h bro-agent
+
+# One 5.5h chunk of the 100-hour trainer per run. Safe to re-run:
+# the queue, hours and best are all derived from committed files
+# under nn-100h/, and --resume continues the in-progress experiment.
+on:
+  workflow_dispatch:
+    inputs:
+      max_run_hours:
+        description: "Max wall hours for this chunk"
+        default: "5.5"
+        required: false
+  schedule:
+    - cron: "0 */6 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/nn-100h-bro-agent
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Train one chunk
+        run: |
+          cd nn-100h
+          python3 train.py --resume --max-run-hours "${{ inputs.max_run_hours || '5.5' }}"
+      - name: Commit state back
+        run: |
+          git config user.name "nn-100h-bot"
+          git config user.email "nn-100h-bot@users.noreply.github.com"
+          git add nn-100h/
+          git diff --cached --quiet || git commit -m "nn-100h bro-agent: chunk state (hours/experiments/best)"
+          git push origin feat/nn-100h-bro-agent
