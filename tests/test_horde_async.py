@@ -14,6 +14,8 @@ import sys
 import types
 from dataclasses import dataclass, field
 
+import httpx
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
@@ -114,6 +116,7 @@ from app.horde_llm import (  # noqa: E402
     HordeChatModel,
     _ahorde_generate,
     _ahorde_generate_on,
+    _horde_generate,
     _messages_to_prompt,
     _parse_tool_calls,
     _tool_schema_text,
@@ -352,3 +355,160 @@ def test_resolve_models_falls_back_on_api_failure():
 
     got = horde.resolve_models(horde.HORDE_UNCENSORED_MODELS, http_get=bad)
     assert got == horde.HORDE_UNCENSORED_MODELS
+
+
+# ---- host failover on non-RuntimeError failures ----
+# The old _horde_generate/_ahorde_generate caught only RuntimeError, so a
+# 5xx (httpx.HTTPStatusError via raise_for_status) or a non-JSON reply
+# (ValueError via .json()) from the first host aborted the call instead
+# of trying the next host — even though the module promises host failover.
+# The fakes below raise the REAL httpx errors, unlike the _FakeResp above
+# whose raise_for_status raises RuntimeError (which the old code caught).
+
+
+class _HttpErrorResp:
+    """Response whose raise_for_status raises the real httpx error."""
+
+    def __init__(self, status: int, payload: dict | None = None):
+        self.status_code = status
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            req = httpx.Request("POST", "https://x.example/")
+            raise httpx.HTTPStatusError(
+                f"HTTP {self.status_code}",
+                request=req,
+                response=httpx.Response(self.status_code, request=req),
+            )
+
+
+class _BadJsonResp:
+    """200 with a body that is not JSON — .json() raises ValueError."""
+
+    status_code = 200
+
+    def json(self):
+        raise ValueError("not JSON")
+
+    def raise_for_status(self):
+        return None
+
+
+class _FakeSyncClient:
+    """Fake httpx.Client: submit ok, status poll done on first check."""
+
+    def __init__(self, *a, **k):
+        self.posts: list[str] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def post(self, url, headers=None, json=None):
+        self.posts.append(url)
+        return _HttpErrorResp(202, {"id": "job-1"})
+
+    def get(self, url, headers=None):
+        return _HttpErrorResp(200, {"done": True, "generations": [{"text": "sync hello"}]})
+
+
+def _sync_client_first_host_500():
+    class Fail500(_FakeSyncClient):
+        def post(self, url, headers=None, json=None):
+            self.posts.append(url)
+            if "stablehorde" in url:
+                return _HttpErrorResp(500)
+            return super().post(url, headers=headers, json=json)
+
+    return Fail500
+
+
+def _sync_client_first_host_bad_json():
+    class BadJson(_FakeSyncClient):
+        def post(self, url, headers=None, json=None):
+            self.posts.append(url)
+            if "stablehorde" in url:
+                return _BadJsonResp()
+            return super().post(url, headers=headers, json=json)
+
+    return BadJson
+
+
+def _run_sync_generate(monkeypatch, client_cls):
+    monkeypatch.setattr(
+        horde, "HORDE_APIS", ["https://stablehorde.net/api/v2", "https://aihorde.net/api/v2"]
+    )
+    monkeypatch.setattr(horde.httpx, "Client", client_cls)
+    monkeypatch.setattr(horde.time, "sleep", lambda _s: None)
+    return _horde_generate("hi", ["m"], 8192, 500, 0.3, 60)
+
+
+def test_horde_generate_fails_over_on_500(monkeypatch):
+    client_cls = _sync_client_first_host_500()
+    # capture the client instance to inspect which hosts were tried
+    seen: list[str] = []
+
+    orig_init = client_cls.__init__
+
+    def capture(self, *a, **k):
+        orig_init(self, *a, **k)
+        seen.append(self)
+
+    monkeypatch.setattr(client_cls, "__init__", capture)
+    text = _run_sync_generate(monkeypatch, client_cls)
+    assert text == "sync hello"
+    posts = [u for c in seen for u in c.posts]
+    assert any("stablehorde" in u for u in posts)
+    assert any("aihorde" in u for u in posts)
+
+
+def test_horde_generate_fails_over_on_non_json_submit(monkeypatch):
+    client_cls = _sync_client_first_host_bad_json()
+    text = _run_sync_generate(monkeypatch, client_cls)
+    assert text == "sync hello"
+
+
+def test_horde_generate_all_hosts_down_raises(monkeypatch):
+    class AllDown(_FakeSyncClient):
+        def post(self, url, headers=None, json=None):
+            self.posts.append(url)
+            return _HttpErrorResp(500)
+
+    monkeypatch.setattr(
+        horde, "HORDE_APIS", ["https://stablehorde.net/api/v2", "https://aihorde.net/api/v2"]
+    )
+    monkeypatch.setattr(horde.httpx, "Client", AllDown)
+    monkeypatch.setattr(horde.time, "sleep", lambda _s: None)
+    try:
+        _horde_generate("hi", ["m"], 8192, 500, 0.3, 60)
+    except RuntimeError as e:
+        assert "all endpoints failed" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_ahorde_generate_fails_over_on_500(monkeypatch):
+    calls = []
+
+    class Fail500ThenOk(_FakeAsyncClient):
+        async def post(self, url, headers=None, json=None):
+            calls.append(url)
+            if "stablehorde" in url:
+                return _HttpErrorResp(500)
+            return await super().post(url, headers=headers, json=json)
+
+    monkeypatch.setattr(
+        horde, "HORDE_APIS", ["https://stablehorde.net/api/v2", "https://aihorde.net/api/v2"]
+    )
+    monkeypatch.setattr(horde.httpx, "AsyncClient", Fail500ThenOk)
+    monkeypatch.setattr(horde.asyncio, "sleep", _no_sleep)
+    text = asyncio.run(_ahorde_generate("hi", ["m"], 8192, 500, 0.3, 60))
+    assert text == "async hello"
+    assert any("stablehorde" in u for u in calls)
+    assert any("aihorde" in u for u in calls)

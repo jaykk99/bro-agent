@@ -120,7 +120,6 @@ def resolve_models(configured: list[str], http_get=None) -> list[str]:
     return HORDE_UNCENSORED_MODELS
 
 TOOL_CALL_FENCE_RE = re.compile(r"```tool_call\s*\n?(.*?)```", re.DOTALL)
-TOOL_CALL_JSON_RE = re.compile(r"\{[^{}]*\"name\"\s*:\s*\"([^\"]+)\"[^{}]*\}", re.DOTALL)
 
 TOOL_FORMAT_INSTRUCTIONS = """You have tools. Use them when they help; otherwise just reply.
 
@@ -211,18 +210,32 @@ def _parse_tool_calls(text: str) -> tuple[str, list[dict]]:
             calls.append({"name": name, "args": args})
     clean = TOOL_CALL_FENCE_RE.sub("", text).strip()
     # Lenient fallback: bare {"name": "...", ...} JSON without the fence.
+    # raw_decode (not a [^{}]* regex) so nested "arguments" objects parse
+    # too — the old regex could not span nested braces, so the most
+    # natural bare form (same shape as the fenced format) was silently
+    # dropped and the raw JSON shown to the user as reply text instead
+    # of executing the tool call.
     if not calls:
-        for m in TOOL_CALL_JSON_RE.finditer(text):
+        decoder = json.JSONDecoder()
+        for i, ch in enumerate(text):
+            if ch != "{":
+                continue
             try:
-                obj = json.loads(m.group(0))
-            except Exception:
+                obj, end = decoder.raw_decode(text[i:])
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
                 continue
             name = obj.get("name")
-            args = {k: v for k, v in obj.items() if k != "name"}
-            if name:
-                calls.append({"name": name, "args": args if isinstance(args, dict) else {}})
-                clean = text.replace(m.group(0), "").strip()
-                break
+            if not name or not isinstance(name, str):
+                continue
+            args = obj.get("arguments")
+            if not isinstance(args, dict):
+                # Flat form: every key except "name" is an argument.
+                args = {k: v for k, v in obj.items() if k != "name"}
+            calls.append({"name": name, "args": args})
+            clean = (text[:i] + text[i + end:]).strip()
+            break
     return clean, calls
 
 
@@ -260,7 +273,11 @@ def _horde_generate(prompt: str, models: list[str], max_context_length: int,
     for api in HORDE_APIS:
         try:
             return _horde_generate_on(api, headers, body, timeout_s)
-        except RuntimeError as e:
+        except Exception as e:
+            # Broad on purpose: a 5xx raises httpx.HTTPStatusError and a
+            # non-JSON reply raises ValueError, and neither is a
+            # RuntimeError — catching only RuntimeError aborted the whole
+            # call on the first host instead of failing over to the next.
             logger.warning("horde: %s failed: %s", api, e)
             last_error = e
             continue
@@ -283,7 +300,9 @@ async def _ahorde_generate(prompt: str, models: list[str], max_context_length: i
     for api in HORDE_APIS:
         try:
             return await _ahorde_generate_on(api, headers, body, timeout_s)
-        except RuntimeError as e:
+        except Exception as e:
+            # Broad on purpose — see _horde_generate: a 5xx or a non-JSON
+            # reply from one host must fail over, not abort the call.
             logger.warning("horde: %s failed: %s", api, e)
             last_error = e
             continue

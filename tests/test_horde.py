@@ -33,6 +33,30 @@ def test_parse_bad_json_ignored():
     assert calls == []
 
 
+def test_parse_bare_json_nested_arguments():
+    # Most natural bare form: same shape as the fenced format, no fence.
+    # The old [^{}]* regex could not span the nested "arguments" object,
+    # so this parsed to zero calls and the raw JSON was shown as reply text.
+    text = 'Let me search.\n{"name": "web_search", "arguments": {"query": "winnipeg weather"}}'
+    clean, calls = _parse_tool_calls(text)
+    assert calls == [{"name": "web_search", "args": {"query": "winnipeg weather"}}]
+    assert "web_search" not in clean
+    assert "Let me search." in clean
+
+
+def test_parse_bare_json_flat_form():
+    clean, calls = _parse_tool_calls('{"name": "web_search", "query": "winnipeg"}')
+    assert calls == [{"name": "web_search", "args": {"query": "winnipeg"}}]
+    assert clean == ""
+
+
+def test_parse_bare_json_skips_non_tool_objects():
+    text = 'Config was {"foo": 1}. Now calling {"name": "file_read", "arguments": {"path": "a.txt"}}'
+    clean, calls = _parse_tool_calls(text)
+    assert calls == [{"name": "file_read", "args": {"path": "a.txt"}}]
+    assert '{"foo": 1}' in clean
+
+
 def test_bind_tools_injects_prompt():
     class FakeTool:
         name = "web_search"
