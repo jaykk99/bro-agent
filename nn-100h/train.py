@@ -346,6 +346,12 @@ def main():
 
     status = load_json(HERE / "status.json") or {}
     base_hours = float(status.get("hours_trained", 0.0))
+    if status.get("status") == "done":
+        # Terminal state: touch NOTHING (no status/heartbeat writes), so
+        # the CircleCI commit step finds no changes and the chain stops
+        # instead of looping on empty checkpoint commits.
+        log("already done, nothing to do")
+        return 0
     best = load_json(HERE / "best.json")
     if best is None:
         exps = read_experiments()
