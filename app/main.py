@@ -627,6 +627,7 @@ async def chat(req: ChatRequest, request: Request):
                 order = router.chat_order()
                 messages = [{"role": m["role"], "content": m["content"]} for m in build_window(history)]
                 final_text, final_source, final_error = "", "", ""
+                turn_started = time.monotonic()
                 # Walk the provider chain: on hard error OR refusal boilerplate
                 # from ANY model (Jay's standing order — never show Jay a
                 # refusal on legit work while another provider is untried),
@@ -647,6 +648,7 @@ async def chat(req: ChatRequest, request: Request):
                         if looks_like_refusal(text) and i < len(order) - 1:
                             logger.warning("provider %s refused legit work, skipping to next", source)
                             router.record_failure(source)
+                            stats.record_failure(source)
                             await queue.put(
                                 {"type": "progress", "stage": "refused", "provider": source}
                             )
@@ -657,6 +659,7 @@ async def chat(req: ChatRequest, request: Request):
                     except Exception as e:
                         logger.exception("agent turn failed on %s", provider)
                         router.record_failure(provider)
+                        stats.record_failure(provider)
                         await queue.put(
                             {
                                 "type": "progress",
@@ -669,7 +672,10 @@ async def chat(req: ChatRequest, request: Request):
                 if final_text:
                     memory.add_message(thread_id, "assistant", final_text)
                     in_chars = sum(len(str(m.get("content", ""))) for m in messages)
-                    stats.record_turn(final_source, in_chars, len(final_text))
+                    stats.record_turn(
+                        final_source, in_chars, len(final_text),
+                        duration_ms=int((time.monotonic() - turn_started) * 1000),
+                    )
                     await queue.put({"type": "done", "reply": final_text, "model": final_source})
                 else:
                     err = f"Agent error: {final_error or 'all providers failed'}"

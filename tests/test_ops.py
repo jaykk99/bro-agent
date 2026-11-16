@@ -115,9 +115,63 @@ def test_stats_record_and_get():
     today = [r for r in rows if r["day"] == "2026-10-20"]
     p = next(r for r in today if r["provider"] == "pollinations")
     assert p["turns"] == 2 and p["in_chars"] == 300 and p["out_chars"] == 110
-    r = client.get("/api/stats")
+    r = client.get("/api/stats?days=30")
     assert r.status_code == 200
     assert any(s["provider"] == "horde" for s in r.json()["stats"])
+
+
+def test_stats_records_failures_and_latency():
+    stats.record_turn("pollinations", 100, 50, day="2026-10-21", duration_ms=1200)
+    stats.record_turn("pollinations", 100, 50, day="2026-10-21", duration_ms=800)
+    stats.record_failure("horde", day="2026-10-21")
+    stats.record_failure("horde", day="2026-10-21")
+    rows = stats.get_stats(days=30)
+    today = [r for r in rows if r["day"] == "2026-10-21"]
+    p = next(r for r in today if r["provider"] == "pollinations")
+    assert p["turns"] == 2 and p["total_ms"] == 2000 and p["avg_ms"] == 1000
+    assert p["failures"] == 0
+    h = next(r for r in today if r["provider"] == "horde")
+    assert h["turns"] == 0 and h["failures"] == 2 and h["avg_ms"] == 0
+    # a failures-only day still shows up: an outage is visible, not silent
+    r = client.get("/api/stats?days=30")
+    assert r.status_code == 200
+    api_h = next(s for s in r.json()["stats"] if s["day"] == "2026-10-21" and s["provider"] == "horde")
+    assert api_h["failures"] == 2 and "total_ms" in api_h and "avg_ms" in api_h
+
+
+def test_stats_migrates_legacy_table():
+    # DBs created before failures/total_ms existed have the 5-column table;
+    # connecting must add the columns and keep the old rows.
+    c = stats._connect()
+    with stats._lock:
+        c.execute("DROP TABLE chat_stats")
+        c.execute(
+            "CREATE TABLE chat_stats (day TEXT NOT NULL, provider TEXT NOT NULL,"
+            " turns INTEGER NOT NULL DEFAULT 0, in_chars INTEGER NOT NULL DEFAULT 0,"
+            " out_chars INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, provider))"
+        )
+        c.execute(
+            "INSERT INTO chat_stats (day, provider, turns, in_chars, out_chars)"
+            " VALUES ('2026-10-19', 'pollinations', 3, 300, 150)"
+        )
+        c.commit()
+    stats._conn.close()
+    stats._conn = None
+    stats._connect()  # runs the migration
+    legacy = next(r for r in stats.get_stats(days=30) if r["day"] == "2026-10-19")
+    assert legacy["turns"] == 3 and legacy["failures"] == 0
+    assert legacy["total_ms"] == 0 and legacy["avg_ms"] == 0
+    stats.record_failure("pollinations", day="2026-10-19")
+    stats.record_turn("pollinations", 10, 5, day="2026-10-19", duration_ms=400)
+    legacy = next(r for r in stats.get_stats(days=30) if r["day"] == "2026-10-19")
+    assert legacy["turns"] == 4 and legacy["failures"] == 1
+    assert legacy["total_ms"] == 400 and legacy["avg_ms"] == 100
+
+
+def test_stats_day_window():
+    stats.record_turn("pollinations", 1, 1, day="2026-09-01")
+    assert not any(r["day"] == "2026-09-01" for r in stats.get_stats(days=14))
+    assert any(r["day"] == "2026-09-01" for r in stats.get_stats(days=90))
 
 
 def test_thread_export():

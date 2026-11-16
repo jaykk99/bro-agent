@@ -605,8 +605,8 @@ async function loadOps() {
   try {
     const s = await (await api("/api/stats" + q)).json();
     const rows = s.stats || [];
-    $("ops-stats").innerHTML = rows.length ? `<table><tr><th>day</th><th>provider</th><th>turns</th><th>in chars</th><th>out chars</th></tr>` +
-      rows.slice(0, 28).map(r => `<tr><td>${r.day}</td><td>${esc(r.provider)}</td><td>${r.turns}</td><td>${r.in_chars}</td><td>${r.out_chars}</td></tr>`).join("") + `</table>`
+    $("ops-stats").innerHTML = rows.length ? `<table><tr><th>day</th><th>provider</th><th>turns</th><th>failures</th><th>in chars</th><th>out chars</th><th>avg ms</th></tr>` +
+      rows.slice(0, 28).map(r => `<tr><td>${r.day}</td><td>${esc(r.provider)}</td><td>${r.turns}</td><td>${r.failures ?? 0}</td><td>${r.in_chars}</td><td>${r.out_chars}</td><td>${r.avg_ms ?? 0}</td></tr>`).join("") + `</table>`
       : `<div class="ops-empty">no usage yet</div>`;
   } catch (e) { $("ops-stats").innerHTML = `<div class="ops-empty">failed to load</div>`; }
   try {

@@ -83,7 +83,7 @@ Chat: `POST /api/chat` (SSE stream, 30 turns/min rate-limited).
 Threads: list / messages / rename / delete / Markdown export. `GET /api/threads` takes
 `?search=` (matches titles + message content); `GET /api/threads/{id}` takes
 `?limit=&offset=` for paging history (limit clamped to 1000).
-Models: `GET /api/models` (chain health), `GET /api/stats` (usage counts).
+Models: `GET /api/models` (chain health), `GET /api/stats` (usage counts per provider per day, including failed turns and average turn latency).
 Uploads: `POST /api/upload` (into `workdir/uploads/`), `GET /api/uploads` (list),
 `DELETE /api/uploads/{name}` (delete) — also shown in the ops dashboard.
 Work files: `GET /api/files` (browse the agent workdir, `?path=` subdir, dirs first),
