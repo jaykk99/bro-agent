@@ -1,7 +1,7 @@
 {
   "repo": "jaykk99/bro-agent",
-  "hours_trained": 37.720842,
-  "experiments_done": 11792,
+  "hours_trained": 38.470857,
+  "experiments_done": 11963,
   "best": {
     "exp_id": "exp-11471",
     "config": {
@@ -632,7 +632,7 @@
   "status": "training",
   "target_hours": 100.0,
   "max_run_hours": 0.75,
-  "current_exp_id": "exp-11793",
-  "current_epoch": 335,
-  "updated": "2026-11-17T14:38:43Z"
+  "current_exp_id": "exp-11964",
+  "current_epoch": 312,
+  "updated": "2026-11-17T15:24:11Z"
 }
