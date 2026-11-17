@@ -88,6 +88,21 @@ def run_reap_once(max_working_s: float = 3600) -> dict:
             first_error = f"forge reap failed: {e}"
         logger.exception("auto-reaper: forge half failed")
 
+    # Housekeeping, not reaping: drop per-day usage rows older than
+    # BRO_STATS_KEEP_DAYS (default 90) so chat_stats stays bounded.
+    # Best-effort only — a prune failure is logged and never marks the
+    # reap pass as failed, since no stuck job depends on it.
+    try:
+        from . import stats as _stats
+
+        try:
+            keep_days = int(os.environ.get("BRO_STATS_KEEP_DAYS", "90"))
+        except (TypeError, ValueError):
+            keep_days = 90
+        _stats.prune_stats(keep_days)
+    except Exception:
+        logger.exception("auto-reaper: stats prune failed")
+
     result = {
         "requeued": list(dict.fromkeys(requeued)),
         "failed": list(dict.fromkeys(failed)),

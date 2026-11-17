@@ -19,15 +19,28 @@ Two behaviors:
    Jay a refusal. This is a routing decision, not a guard removal — the
    hard-boundary pre-check in app/refusal.py still runs first and genuine
    boundary hits are never retried.
+
+3. Cooldown persistence: provider health lives in the same SQLite DB as
+   chat memory (table provider_health), so a cooldown survives the
+   process restarts Render's free tier does on every sleep/wake. Without
+   it, a provider that just failed twice got a clean slate on every wake
+   and was retried first all over again. Persistence is best-effort: a
+   DB error disables it for that router instance and routing carries on
+   in memory, never raising. Disable with BRO_ROUTER_PERSIST=0.
 """
 
 from __future__ import annotations
 
+import logging
+import os
 import re
+import sqlite3
 import time
 from dataclasses import dataclass, field
 
 from . import guard_policy
+
+logger = logging.getLogger(__name__)
 
 PROVIDERS = ("horde", "pollinations")
 
@@ -108,10 +121,83 @@ class _ProviderState:
 
 
 class ModelRouter:
-    """Picks provider order, tracks failures, applies cooldowns."""
+    """Picks provider order, tracks failures, applies cooldowns.
 
-    def __init__(self, providers: tuple[str, ...] = PROVIDERS):
+    Pass db_path to persist provider health across restarts (table
+    provider_health in that SQLite file). db_path=None means in-memory
+    only. The default (no db_path given) resolves to the chat-memory DB
+    unless BRO_ROUTER_PERSIST=0.
+    """
+
+    _UNSET = object()
+
+    def __init__(self, providers: tuple[str, ...] = PROVIDERS, db_path=_UNSET):
         self._states: dict[str, _ProviderState] = {p: _ProviderState(p) for p in providers}
+        if db_path is self._UNSET:
+            db_path = _default_db_path()
+        self._db_path: str | None = db_path  # type: ignore[assignment]
+        if self._db_path:
+            self._load_persisted()
+
+    def _load_persisted(self) -> None:
+        """Restore health from the DB. A missing DB file means nothing was
+        ever persisted — skip without creating anything. Any DB error
+        disables persistence for this instance; routing stays in-memory."""
+        assert self._db_path is not None
+        try:
+            if not os.path.exists(self._db_path):
+                return
+            conn = sqlite3.connect(self._db_path)
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS provider_health ("
+                    "provider TEXT PRIMARY KEY, consecutive_failures INTEGER NOT NULL DEFAULT 0, "
+                    "cooldown_until REAL NOT NULL DEFAULT 0)"
+                )
+                for provider, failures, cooldown_until in conn.execute(
+                    "SELECT provider, consecutive_failures, cooldown_until FROM provider_health"
+                ):
+                    st = self._states.get(provider)
+                    if st is not None:
+                        st.consecutive_failures = max(0, int(failures or 0))
+                        st.cooldown_until = float(cooldown_until or 0)
+            finally:
+                conn.close()
+        except Exception:
+            logger.warning("router health persistence unavailable, continuing in-memory", exc_info=True)
+            self._db_path = None
+
+    def _save_persisted(self, name: str) -> None:
+        """Write one provider's health to the DB. Best-effort: a failure
+        here must never break a chat turn, so it disables persistence
+        for this instance and routing carries on in memory."""
+        if not self._db_path:
+            return
+        st = self._states.get(name)
+        if st is None:
+            return
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self._db_path)), exist_ok=True)
+            conn = sqlite3.connect(self._db_path)
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS provider_health ("
+                    "provider TEXT PRIMARY KEY, consecutive_failures INTEGER NOT NULL DEFAULT 0, "
+                    "cooldown_until REAL NOT NULL DEFAULT 0)"
+                )
+                conn.execute(
+                    "INSERT INTO provider_health (provider, consecutive_failures, cooldown_until)"
+                    " VALUES (?, ?, ?) ON CONFLICT(provider) DO UPDATE SET"
+                    " consecutive_failures=excluded.consecutive_failures,"
+                    " cooldown_until=excluded.cooldown_until",
+                    (name, st.consecutive_failures, st.cooldown_until),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            logger.warning("router health save failed, continuing in-memory", exc_info=True)
+            self._db_path = None
 
     def preferred_order(self) -> list[str]:
         """Healthy providers first, then cooled-down ones.
@@ -157,6 +243,7 @@ class ModelRouter:
         if st:
             st.consecutive_failures = 0
             st.cooldown_until = 0.0
+            self._save_persisted(name)
 
     def record_failure(self, name: str) -> None:
         st = self._states.get(name)
@@ -165,6 +252,7 @@ class ModelRouter:
         st.consecutive_failures += 1
         if st.consecutive_failures >= FAILURE_THRESHOLD:
             st.cooldown_until = time.time() + COOLDOWN_S
+        self._save_persisted(name)
 
     def status(self) -> dict:
         now = time.time()
@@ -179,9 +267,28 @@ class ModelRouter:
 
 
 # Process-wide router — provider health is a property of the deployment,
-# not of one request.
-_router = ModelRouter()
+# not of one request. Built lazily so importing this module never touches
+# the DB (tests that only need looks_like_refusal stay side-effect free).
+_router: ModelRouter | None = None
+
+
+def _default_db_path() -> str | None:
+    """Where the process-wide router persists health: the chat-memory DB,
+    unless BRO_ROUTER_PERSIST=0. A failure to resolve it means in-memory
+    only — routing must never depend on the DB being reachable."""
+    if os.environ.get("BRO_ROUTER_PERSIST", "1") == "0":
+        return None
+    try:
+        from .memory import DB_PATH
+
+        return DB_PATH
+    except Exception:
+        logger.warning("router health persistence unavailable, continuing in-memory", exc_info=True)
+        return None
 
 
 def get_router() -> ModelRouter:
+    global _router
+    if _router is None:
+        _router = ModelRouter()
     return _router

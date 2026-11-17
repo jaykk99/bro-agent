@@ -49,12 +49,12 @@ def test_legit_answers_not_refusals():
 
 
 def test_initial_order_prefers_horde_uncensored_first():
-    r = ModelRouter()
+    r = ModelRouter(db_path=None)
     assert r.preferred_order() == ["horde", "pollinations"]
 
 
 def test_failures_cool_down_provider():
-    r = ModelRouter()
+    r = ModelRouter(db_path=None)
     r.record_failure("horde")
     assert r.preferred_order() == ["horde", "pollinations"]  # 1 failure: still first
     r.record_failure("horde")
@@ -66,7 +66,7 @@ def test_failures_cool_down_provider():
 
 
 def test_success_resets_failures():
-    r = ModelRouter()
+    r = ModelRouter(db_path=None)
     r.record_failure("horde")
     r.record_failure("horde")
     assert r.preferred_order()[0] == "pollinations"
@@ -76,21 +76,21 @@ def test_success_resets_failures():
 
 
 def test_unknown_provider_ignored():
-    r = ModelRouter()
+    r = ModelRouter(db_path=None)
     r.record_failure("gpt-5")  # no such provider — must not crash
     r.record_success("gpt-5")
     assert r.preferred_order() == ["horde", "pollinations"]
 
 
 def test_chat_order_streams_first_when_healthy():
-    r = ModelRouter()
+    r = ModelRouter(db_path=None)
     assert r.chat_order() == ["pollinations", "horde"]
     # Uncensored-first order is untouched for everything else.
     assert r.preferred_order() == ["horde", "pollinations"]
 
 
 def test_chat_order_health_beats_streaming():
-    r = ModelRouter()
+    r = ModelRouter(db_path=None)
     r.record_failure("pollinations")
     r.record_failure("pollinations")  # cooled down: healthy horde leads
     assert r.chat_order() == ["horde", "pollinations"]
