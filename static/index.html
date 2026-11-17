@@ -605,7 +605,9 @@ async function loadOps() {
   try {
     const s = await (await api("/api/stats" + q)).json();
     const rows = s.stats || [];
-    $("ops-stats").innerHTML = rows.length ? `<table><tr><th>day</th><th>provider</th><th>turns</th><th>failures</th><th>in chars</th><th>out chars</th><th>avg ms</th></tr>` +
+    const sumRows = (s.summary || []).map(x => `<tr><td>${esc(x.provider)}</td><td>${x.turns}</td><td>${x.failures ?? 0}</td><td>${((x.failure_rate ?? 0) * 100).toFixed(1)}%</td><td>${x.avg_ms ?? 0}</td></tr>`).join("");
+    const sumTable = sumRows ? `<table><tr><th>provider</th><th>turns</th><th>failures</th><th>fail rate</th><th>avg ms</th></tr>${sumRows}</table>` : "";
+    $("ops-stats").innerHTML = rows.length ? sumTable + `<table><tr><th>day</th><th>provider</th><th>turns</th><th>failures</th><th>in chars</th><th>out chars</th><th>avg ms</th></tr>` +
       rows.slice(0, 28).map(r => `<tr><td>${r.day}</td><td>${esc(r.provider)}</td><td>${r.turns}</td><td>${r.failures ?? 0}</td><td>${r.in_chars}</td><td>${r.out_chars}</td><td>${r.avg_ms ?? 0}</td></tr>`).join("") + `</table>`
       : `<div class="ops-empty">no usage yet</div>`;
   } catch (e) { $("ops-stats").innerHTML = `<div class="ops-empty">failed to load</div>`; }

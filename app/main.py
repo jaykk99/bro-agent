@@ -220,9 +220,12 @@ def models(access_code: str = ""):
 
 @app.get("/api/stats")
 def usage_stats(access_code: str = "", days: int = 14):
-    """Per-day chat turns per provider (counts only, no message content)."""
+    """Per-day chat turns per provider (counts only, no message content),
+    plus per-provider totals for the window. days clamps to 1..365: an
+    unbounded window would dump the whole chat_stats table."""
     _check_access(access_code)
-    return {"stats": stats.get_stats(days)}
+    days = max(1, min(days, 365))
+    return {"stats": stats.get_stats(days), "summary": stats.get_summary(days)}
 
 
 @app.get("/api/threads/{thread_id}/export")

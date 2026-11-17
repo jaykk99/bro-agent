@@ -103,3 +103,44 @@ def get_stats(days: int = 14) -> list[dict]:
         d["avg_ms"] = round(d["total_ms"] / d["turns"]) if d["turns"] else 0
         out.append(d)
     return out
+
+
+def get_summary(days: int = 14) -> list[dict]:
+    """Per-provider totals over the window: turns, failures, chars, avg
+    turn latency, and failure rate (failures / turns+failures). One row
+    per provider with any activity in the window — the ops dashboard
+    totals line. A provider that only failed still shows up, with
+    failure_rate 1.0, so an outage reads as an outage, not as no usage."""
+    c = _connect()
+    days = max(1, days)
+    cutoff = (datetime.date.today() - datetime.timedelta(days=days - 1)).isoformat()
+    rows = c.execute(
+        "SELECT provider, SUM(turns) AS turns, SUM(failures) AS failures,"
+        " SUM(in_chars) AS in_chars, SUM(out_chars) AS out_chars,"
+        " SUM(total_ms) AS total_ms"
+        " FROM chat_stats WHERE day >= ? GROUP BY provider ORDER BY provider ASC",
+        (cutoff,),
+    ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        attempts = (d["turns"] or 0) + (d["failures"] or 0)
+        d["avg_ms"] = round(d["total_ms"] / d["turns"]) if d["turns"] else 0
+        d["failure_rate"] = round(d["failures"] / attempts, 4) if attempts else 0.0
+        out.append(d)
+    return out
+
+
+def prune_stats(keep_days: int = 90) -> int:
+    """Delete per-day rows older than keep_days (default 90). chat_stats
+    grows one row per provider per active day forever, so without this
+    the ops table is unbounded on Render's ephemeral disk. Returns the
+    number of rows deleted. Called from the auto-reaper's housekeeping
+    pass; keep_days comes from BRO_STATS_KEEP_DAYS there."""
+    c = _connect()
+    keep_days = max(1, keep_days)
+    cutoff = (datetime.date.today() - datetime.timedelta(days=keep_days)).isoformat()
+    with _lock:
+        cur = c.execute("DELETE FROM chat_stats WHERE day < ?", (cutoff,))
+        c.commit()
+        return cur.rowcount
