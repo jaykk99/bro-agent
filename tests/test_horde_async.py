@@ -117,6 +117,7 @@ from app.horde_llm import (  # noqa: E402
     _ahorde_generate,
     _ahorde_generate_on,
     _horde_generate,
+    _horde_generate_on,
     _messages_to_prompt,
     _parse_tool_calls,
     _tool_schema_text,
@@ -512,3 +513,142 @@ def test_ahorde_generate_fails_over_on_500(monkeypatch):
     assert text == "async hello"
     assert any("stablehorde" in u for u in calls)
     assert any("aihorde" in u for u in calls)
+
+
+# ---- status-poll fail-fast ----
+# Before this fix a 429/5xx on every status poll was swallowed (`continue`)
+# until the whole 60s timeout burned, then misreported as "timed out" —
+# so the router could not fail over to the next host / Pollinations for
+# a full minute even though the host was clearly sick. Now three bad
+# polls in a row raise, and the host failover kicks in immediately.
+
+
+class _PollSickAsyncClient(_FakeAsyncClient):
+    """Submit ok, every status poll returns the given error status."""
+
+    def __init__(self, *a, status=500, **k):
+        super().__init__(*a, **k)
+        self._status = status
+
+    async def get(self, url, headers=None):
+        self.polls += 1
+        return _FakeResp(self._status, {})
+
+
+class _PollSickSyncClient(_FakeSyncClient):
+    """Sync twin: submit ok, every status poll returns the given error."""
+
+    def __init__(self, *a, status=500, **k):
+        super().__init__(*a, **k)
+        self._status = status
+        self.polls = 0
+
+    def get(self, url, headers=None):
+        self.polls += 1
+        return _HttpErrorResp(self._status)
+
+
+def test_ahorde_generate_on_fails_fast_on_repeated_poll_500(monkeypatch):
+    client = _PollSickAsyncClient(status=500)
+    monkeypatch.setattr(horde.httpx, "AsyncClient", lambda *a, **k: client)
+    monkeypatch.setattr(horde.asyncio, "sleep", _no_sleep)
+    try:
+        asyncio.run(_ahorde_generate_on("https://x.example/api/v2", {"apikey": "k"}, {"prompt": "hi"}, 60))
+    except RuntimeError as e:
+        assert "status poll failed" in str(e)
+        assert "500" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+    # fail-fast: exactly the threshold polls, not ~15 polls of a 60s wait
+    assert client.polls == horde.POLL_ERROR_THRESHOLD
+
+
+def test_ahorde_generate_on_fails_fast_on_poll_429(monkeypatch):
+    # 429 is the motivating case: rate-limited host, fail over now.
+    client = _PollSickAsyncClient(status=429)
+    monkeypatch.setattr(horde.httpx, "AsyncClient", lambda *a, **k: client)
+    monkeypatch.setattr(horde.asyncio, "sleep", _no_sleep)
+    try:
+        asyncio.run(_ahorde_generate_on("https://x.example/api/v2", {"apikey": "k"}, {"prompt": "hi"}, 60))
+    except RuntimeError as e:
+        assert "status poll failed" in str(e) and "429" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+    assert client.polls == horde.POLL_ERROR_THRESHOLD
+
+
+def test_ahorde_generate_on_tolerates_transient_poll_errors(monkeypatch):
+    # Two bad polls then a healthy 200 must NOT raise: the counter resets
+    # on any 200, so blips do not trigger failover.
+    class BlipThenOk(_FakeAsyncClient):
+        async def get(self, url, headers=None):
+            self.polls += 1
+            if self.polls <= 2:
+                return _FakeResp(503, {})
+            return _FakeResp(200, {"done": True, "generations": [{"text": "recovered"}]})
+
+    monkeypatch.setattr(horde.httpx, "AsyncClient", BlipThenOk)
+    monkeypatch.setattr(horde.asyncio, "sleep", _no_sleep)
+    text = asyncio.run(_ahorde_generate_on("https://x.example/api/v2", {"apikey": "k"}, {"prompt": "hi"}, 60))
+    assert text == "recovered"
+
+
+def test_ahorde_generate_fails_over_host_on_sick_poll(monkeypatch):
+    # End to end: first host's polls are all 500, second host answers.
+    # The raise from the poll loop must reach _ahorde_generate's broad
+    # except and try the next host, not abort the call.
+    calls = []
+
+    class SickFirstHost(_FakeAsyncClient):
+        async def post(self, url, headers=None, json=None):
+            calls.append(url)
+            return await super().post(url, headers=headers, json=json)
+
+        async def get(self, url, headers=None):
+            self.polls += 1
+            if "stablehorde" in url:
+                return _FakeResp(500, {})
+            if self.polls < 2:
+                return _FakeResp(200, {"done": False, "wait_time": 1})
+            return _FakeResp(200, {"done": True, "generations": [{"text": "second host"}]})
+
+    # The fake keys polls off the URL host, but get() receives the full
+    # status URL, so the host check above works; submit uses post().
+    monkeypatch.setattr(horde, "HORDE_APIS", ["https://stablehorde.net/api/v2", "https://aihorde.net/api/v2"])
+    monkeypatch.setattr(horde.httpx, "AsyncClient", SickFirstHost)
+    monkeypatch.setattr(horde.asyncio, "sleep", _no_sleep)
+    text = asyncio.run(_ahorde_generate("hi", ["m"], 8192, 500, 0.3, 60))
+    assert text == "second host"
+    assert any("stablehorde" in u for u in calls)
+    assert any("aihorde" in u for u in calls)
+
+
+def test_horde_generate_on_fails_fast_on_repeated_poll_500(monkeypatch):
+    client = _PollSickSyncClient(status=500)
+    monkeypatch.setattr(horde.httpx, "Client", lambda *a, **k: client)
+    monkeypatch.setattr(horde.time, "sleep", lambda _s: None)
+    try:
+        _horde_generate_on("https://x.example/api/v2", {"apikey": "k"}, {"prompt": "hi"}, 60)
+    except RuntimeError as e:
+        assert "status poll failed" in str(e) and "500" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+    assert client.polls == horde.POLL_ERROR_THRESHOLD
+
+
+def test_horde_generate_on_tolerates_transient_poll_errors(monkeypatch):
+    class BlipThenOk(_FakeSyncClient):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.polls = 0
+
+        def get(self, url, headers=None):
+            self.polls += 1
+            if self.polls <= 2:
+                return _HttpErrorResp(503)
+            return _HttpErrorResp(200, {"done": True, "generations": [{"text": "sync recovered"}]})
+
+    monkeypatch.setattr(horde.httpx, "Client", BlipThenOk)
+    monkeypatch.setattr(horde.time, "sleep", lambda _s: None)
+    text = _horde_generate_on("https://x.example/api/v2", {"apikey": "k"}, {"prompt": "hi"}, 60)
+    assert text == "sync recovered"

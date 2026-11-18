@@ -177,9 +177,10 @@ def test_stats_migrates_legacy_table():
 
 
 def test_stats_day_window():
-    stats.record_turn("pollinations", 1, 1, day="2026-09-01")
-    assert not any(r["day"] == "2026-09-01" for r in stats.get_stats(days=14))
-    assert any(r["day"] == "2026-09-01" for r in stats.get_stats(days=90))
+    day = _day_ago(30)  # outside the 14-day window, inside the 90-day one
+    stats.record_turn("pollinations", 1, 1, day=day)
+    assert not any(r["day"] == day for r in stats.get_stats(days=14))
+    assert any(r["day"] == day for r in stats.get_stats(days=90))
 
 
 def test_thread_export():

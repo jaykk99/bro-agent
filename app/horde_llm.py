@@ -64,6 +64,10 @@ HORDE_UNCENSORED_MODELS = [
 # workers online right now (cached 6h), falling back to the hardcoded list
 # when the API is unreachable.
 MODELS_CACHE_S = 6 * 3600
+# Status-poll fail-fast: consecutive non-200 (non-403) poll responses
+# before the host is declared sick and the call fails over (see
+# _horde_generate_on / _ahorde_generate_on).
+POLL_ERROR_THRESHOLD = 3
 _UNCENSORED_HINTS = ("stheno", "heretic", "rocinante", "uncensored")
 _models_cache: tuple[float, list[str]] | None = None
 
@@ -391,13 +395,29 @@ async def _ahorde_generate_on(api: str, headers: dict, submit_body: dict, timeou
 
         poll_headers = {"apikey": headers["apikey"], "User-Agent": HORDE_USER_AGENT}
         deadline = time.time() + timeout_s
+        bad_polls = 0
         while time.time() < deadline:
             await asyncio.sleep(4)
             chk = await client.get(f"{api}/generate/text/status/{job_id}", headers=poll_headers)
             if chk.status_code == 403:
                 raise RuntimeError("horde: 403 forbidden on status poll")
             if chk.status_code != 200:
+                # Fail fast on a persistently sick status endpoint: a
+                # 429/5xx on every poll means this host is not serving
+                # jobs right now, and swallowing it burns the whole
+                # timeout (60s) before the router can fail over to
+                # Pollinations — while also misreporting the failure as
+                # a slow queue ("timed out"). Three bad polls in a row
+                # (~12s) is a real outage, not a blip: raise so the
+                # host failover tries the next Horde host. A single bad
+                # poll is tolerated (the counter resets on any 200).
+                bad_polls += 1
+                if bad_polls >= POLL_ERROR_THRESHOLD:
+                    raise RuntimeError(
+                        f"horde: status poll failed {bad_polls}x in a row (last: {chk.status_code})"
+                    )
                 continue
+            bad_polls = 0
             text = _parse_status_payload(chk.json())
             if text is not None:
                 return text
@@ -418,13 +438,23 @@ def _horde_generate_on(api: str, headers: dict, submit_body: dict, timeout_s: in
 
         poll_headers = {"apikey": headers["apikey"], "User-Agent": HORDE_USER_AGENT}
         deadline = time.time() + timeout_s
+        bad_polls = 0
         while time.time() < deadline:
             time.sleep(4)
             chk = client.get(f"{api}/generate/text/status/{job_id}", headers=poll_headers)
             if chk.status_code == 403:
                 raise RuntimeError("horde: 403 forbidden on status poll")
             if chk.status_code != 200:
+                # Fail fast, same reason as the async twin above: a
+                # persistently sick status endpoint must trigger host
+                # failover now, not after the whole timeout is burned.
+                bad_polls += 1
+                if bad_polls >= POLL_ERROR_THRESHOLD:
+                    raise RuntimeError(
+                        f"horde: status poll failed {bad_polls}x in a row (last: {chk.status_code})"
+                    )
                 continue
+            bad_polls = 0
             s = chk.json()
             text = _parse_status_payload(s)
             if text is not None:
