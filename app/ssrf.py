@@ -67,7 +67,17 @@ class FetchResult:
 
 
 def _is_bad_ip(ip: ipaddress._BaseAddress) -> bool:
-    """True for any non-public-unicast address."""
+    """True for any non-public-unicast address.
+
+    The explicit flags are not enough on their own: on this Python
+    (3.12) the CGNAT / shared address space 100.64.0.0/10 is neither
+    private nor reserved, so a literal http://100.64.x/ URL — or a
+    hostname resolving into CGNAT — sailed through the guard even
+    though the range is not publicly routable (on cloud hosts it can
+    reach provider-internal services). Any address Python does not
+    consider global is refused, so the guard no longer depends on one
+    version's private-network table to cover every special range.
+    """
     return (
         ip.is_loopback
         or ip.is_private
@@ -75,6 +85,7 @@ def _is_bad_ip(ip: ipaddress._BaseAddress) -> bool:
         or ip.is_reserved
         or ip.is_multicast
         or ip.is_unspecified
+        or not ip.is_global
     )
 
 

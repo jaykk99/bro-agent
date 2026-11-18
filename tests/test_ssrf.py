@@ -77,6 +77,28 @@ def test_dns_rebinding_ipv6_blocked(monkeypatch):
     assert check_url("http://evil.example.com/") is not None
 
 
+def test_cgnat_ips_blocked(monkeypatch):
+    # 100.64.0.0/10 (CGNAT / shared address space) is not publicly
+    # routable, but on Python 3.12 is_private and is_reserved are both
+    # False for it, so the old flag-only check let it through — a
+    # literal CGNAT URL and a hostname resolving into CGNAT both passed.
+    for url in [
+        "http://100.64.0.1/",
+        "http://100.64.23.45/admin",
+        "http://100.127.255.255/",
+    ]:
+        assert check_url(url) is not None, url
+    monkeypatch.setattr(ssrf, "_resolve_host", lambda host: ["100.64.0.1"])
+    assert check_url("http://evil.example.com/") is not None
+
+
+def test_public_ips_still_allowed():
+    # The tightening must not refuse real public addresses (v4 + v6).
+    assert check_url("http://8.8.8.8/") is None
+    assert check_url("http://93.184.216.34/") is None
+    assert check_url("http://[2606:4700:4700::1111]/") is None
+
+
 def test_unresolvable_host_blocked(monkeypatch):
     import socket
 
