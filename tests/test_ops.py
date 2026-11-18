@@ -1,5 +1,6 @@
 """Tests for train retry/stuck-failover, usage stats, export, upload."""
 
+import datetime
 import io
 import os
 import sys
@@ -19,6 +20,12 @@ from app import stats, train  # noqa: E402
 from app.main import app  # noqa: E402
 
 client = TestClient(app)
+
+
+def _day_ago(n):
+    # fixed dates rot: a literal 2026-10-19 is outside the 30-day window
+    # a month later. Anchor test days to today so the suite stays green.
+    return (datetime.date.today() - datetime.timedelta(days=n)).isoformat()
 
 
 def _drain_queue():
@@ -108,11 +115,11 @@ def test_reap_stuck_fails_exhausted_job():
 
 
 def test_stats_record_and_get():
-    stats.record_turn("pollinations", 100, 50, day="2026-10-20")
-    stats.record_turn("pollinations", 200, 60, day="2026-10-20")
-    stats.record_turn("horde", 10, 5, day="2026-10-20")
+    stats.record_turn("pollinations", 100, 50, day=_day_ago(5))
+    stats.record_turn("pollinations", 200, 60, day=_day_ago(5))
+    stats.record_turn("horde", 10, 5, day=_day_ago(5))
     rows = stats.get_stats(days=30)
-    today = [r for r in rows if r["day"] == "2026-10-20"]
+    today = [r for r in rows if r["day"] == _day_ago(5)]
     p = next(r for r in today if r["provider"] == "pollinations")
     assert p["turns"] == 2 and p["in_chars"] == 300 and p["out_chars"] == 110
     r = client.get("/api/stats?days=30")
@@ -121,12 +128,12 @@ def test_stats_record_and_get():
 
 
 def test_stats_records_failures_and_latency():
-    stats.record_turn("pollinations", 100, 50, day="2026-10-21", duration_ms=1200)
-    stats.record_turn("pollinations", 100, 50, day="2026-10-21", duration_ms=800)
-    stats.record_failure("horde", day="2026-10-21")
-    stats.record_failure("horde", day="2026-10-21")
+    stats.record_turn("pollinations", 100, 50, day=_day_ago(4), duration_ms=1200)
+    stats.record_turn("pollinations", 100, 50, day=_day_ago(4), duration_ms=800)
+    stats.record_failure("horde", day=_day_ago(4))
+    stats.record_failure("horde", day=_day_ago(4))
     rows = stats.get_stats(days=30)
-    today = [r for r in rows if r["day"] == "2026-10-21"]
+    today = [r for r in rows if r["day"] == _day_ago(4)]
     p = next(r for r in today if r["provider"] == "pollinations")
     assert p["turns"] == 2 and p["total_ms"] == 2000 and p["avg_ms"] == 1000
     assert p["failures"] == 0
@@ -135,7 +142,7 @@ def test_stats_records_failures_and_latency():
     # a failures-only day still shows up: an outage is visible, not silent
     r = client.get("/api/stats?days=30")
     assert r.status_code == 200
-    api_h = next(s for s in r.json()["stats"] if s["day"] == "2026-10-21" and s["provider"] == "horde")
+    api_h = next(s for s in r.json()["stats"] if s["day"] == _day_ago(4) and s["provider"] == "horde")
     assert api_h["failures"] == 2 and "total_ms" in api_h and "avg_ms" in api_h
 
 
@@ -152,18 +159,19 @@ def test_stats_migrates_legacy_table():
         )
         c.execute(
             "INSERT INTO chat_stats (day, provider, turns, in_chars, out_chars)"
-            " VALUES ('2026-10-19', 'pollinations', 3, 300, 150)"
+            " VALUES (?, 'pollinations', 3, 300, 150)",
+            (_day_ago(3),)
         )
         c.commit()
     stats._conn.close()
     stats._conn = None
     stats._connect()  # runs the migration
-    legacy = next(r for r in stats.get_stats(days=30) if r["day"] == "2026-10-19")
+    legacy = next(r for r in stats.get_stats(days=30) if r["day"] == _day_ago(3))
     assert legacy["turns"] == 3 and legacy["failures"] == 0
     assert legacy["total_ms"] == 0 and legacy["avg_ms"] == 0
-    stats.record_failure("pollinations", day="2026-10-19")
-    stats.record_turn("pollinations", 10, 5, day="2026-10-19", duration_ms=400)
-    legacy = next(r for r in stats.get_stats(days=30) if r["day"] == "2026-10-19")
+    stats.record_failure("pollinations", day=_day_ago(3))
+    stats.record_turn("pollinations", 10, 5, day=_day_ago(3), duration_ms=400)
+    legacy = next(r for r in stats.get_stats(days=30) if r["day"] == _day_ago(3))
     assert legacy["turns"] == 4 and legacy["failures"] == 1
     assert legacy["total_ms"] == 400 and legacy["avg_ms"] == 100
 
