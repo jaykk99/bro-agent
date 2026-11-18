@@ -88,6 +88,64 @@ def test_messages_to_prompt_tool_history():
     assert '"name": "web_search"' in p
 
 
+def test_build_prompt_short_prompt_unchanged():
+    # Fits the budget: prompt is byte-identical to the old assembly.
+    m = HordeChatModel()
+    prompt = m._build_prompt([SystemMessage(content="sys"), HumanMessage(content="hi")])
+    assert prompt == "sys\n\nUser: hi\nAssistant:"
+
+
+def test_build_prompt_trims_oldest_first():
+    # Budget 300 chars. The old code cut the END (prompt[:300]), dropping
+    # the newest user turn while keeping stale history; the model then
+    # answered the wrong thing. Now the oldest block goes first and the
+    # newest question survives, with a marker saying context was trimmed.
+    m = HordeChatModel(max_context_length=100)
+    msgs = [
+        SystemMessage(content="sys"),
+        HumanMessage(content="old question " + "x" * 200),
+        HumanMessage(content="new question " + "y" * 50),
+    ]
+    prompt = m._build_prompt(msgs)
+    assert len(prompt) <= 300
+    assert prompt.rstrip().endswith("Assistant:")
+    assert "new question" in prompt
+    assert "old question" not in prompt
+    assert "trimmed to fit context" in prompt
+
+
+def test_build_prompt_trims_history_not_tools():
+    # Tool instructions and the system prompt survive trimming; only
+    # convo history is dropped, oldest first.
+    class FakeTool:
+        name = "web_search"
+        description = "Search the web."
+        args = {"query": "string"}
+
+    m = HordeChatModel(max_context_length=400).bind_tools([FakeTool()])
+    msgs = [SystemMessage(content="sys")]
+    msgs += [HumanMessage(content=f"old {i} " + "x" * 150) for i in range(5)]
+    msgs.append(HumanMessage(content="latest question"))
+    prompt = m._build_prompt(msgs)
+    assert len(prompt) <= 1200
+    assert prompt.rstrip().endswith("Assistant:")
+    assert "web_search" in prompt
+    assert "Search the web." in prompt
+    assert "```tool_call" in prompt
+    assert "latest question" in prompt
+    assert "trimmed to fit context" in prompt
+
+
+def test_build_prompt_keeps_tail_of_huge_newest_message():
+    # One newest message alone exceeds the budget: keep its tail (the
+    # most recent content), never drop the newest turn entirely.
+    m = HordeChatModel(max_context_length=100)
+    prompt = m._build_prompt([HumanMessage(content="z" * 1000)])
+    assert len(prompt) <= 300
+    assert prompt.rstrip().endswith("Assistant:")
+    assert "z" * 200 in prompt
+
+
 def test_llm_type():
     assert HordeChatModel()._llm_type == "horde-uncensored"
 

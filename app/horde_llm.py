@@ -164,8 +164,15 @@ def _tool_schema_text(tools: list[Any]) -> str:
     return "\n".join(lines)
 
 
-def _messages_to_prompt(messages: list[BaseMessage], tools_text: str) -> str:
-    """Flatten LangChain messages into one instruction-style prompt for Horde."""
+def _messages_to_parts(messages: list[BaseMessage], tools_text: str) -> tuple[str, list[str]]:
+    """Split the flattened prompt into (header, convo_blocks).
+
+    Header = system prompt + available-tools block + format instructions;
+    convo_blocks = one block per flattened message turn. The split exists
+    so _build_prompt can trim oldest-first: the header is what the model
+    needs to follow instructions, the newest convo blocks are what it
+    needs to answer.
+    """
     system_parts: list[str] = []
     convo: list[str] = []
     for m in messages:
@@ -185,14 +192,63 @@ def _messages_to_prompt(messages: list[BaseMessage], tools_text: str) -> str:
         else:
             convo.append(f"{m.type}: {content}")
     system = "\n\n".join(system_parts).strip()
-    prompt = ""
+    header = ""
     if system:
-        prompt += system + "\n\n"
+        header += system + "\n\n"
     if tools_text:
-        prompt += "Available tools:\n" + tools_text + "\n\n" + TOOL_FORMAT_INSTRUCTIONS + "\n\n"
-    prompt += "\n".join(convo)
-    prompt += "\nAssistant:"
-    return prompt
+        header += "Available tools:\n" + tools_text + "\n\n" + TOOL_FORMAT_INSTRUCTIONS + "\n\n"
+    return header, convo
+
+
+def _messages_to_prompt(messages: list[BaseMessage], tools_text: str) -> str:
+    """Flatten LangChain messages into one instruction-style prompt for Horde."""
+    header, convo = _messages_to_parts(messages, tools_text)
+    return header + "\n".join(convo) + "\nAssistant:"
+
+
+def _trim_marker(dropped: int) -> str:
+    return f"[{dropped} older message(s) trimmed to fit context]"
+
+
+def _fit_prompt(header: str, convo: list[str], max_chars: int) -> str:
+    """Fit a prompt inside max_chars, trimming oldest convo first.
+
+    The header (system prompt + tool instructions) is never dropped and
+    the newest convo block is always kept — if that single block alone
+    is still too long, its tail (the most recent content) is kept. A
+    marker notes how many older blocks were trimmed so the model knows
+    context is missing instead of hallucinating continuity. The result
+    always ends with the Assistant cue and never exceeds max_chars.
+    """
+    tail = "\nAssistant:"
+    max_chars = max(max_chars, len(tail) + 1)
+    full = header + "\n".join(convo) + tail
+    if len(full) <= max_chars:
+        return full
+    if len(header) + len(tail) >= max_chars:
+        # Even the instructions alone overflow: keep the newest content.
+        return full[-(max_chars - len(tail)):] + tail
+    kept = list(convo)
+    dropped = 0
+    while len(kept) > 1:
+        marker = _trim_marker(dropped + 1)
+        if len(header) + len(marker) + 1 + len("\n".join(kept[1:])) + len(tail) <= max_chars:
+            dropped += 1
+            kept = kept[1:]
+            break
+        dropped += 1
+        kept = kept[1:]
+    body = "\n".join(kept)
+    if dropped:
+        body = _trim_marker(dropped) + "\n" + body
+    if len(header) + len(body) + len(tail) > max_chars:
+        # One huge newest block: keep its tail.
+        keep = max_chars - len(header) - len(tail)
+        body = body[-keep:] if keep > 0 else ""
+    result = header + body + tail
+    if len(result) > max_chars:  # last-resort guard, never over budget
+        result = result[-(max_chars - len(tail)):] + tail
+    return result
 
 
 def _parse_tool_calls(text: str) -> tuple[str, list[dict]]:
@@ -419,12 +475,13 @@ class HordeChatModel(BaseChatModel):
 
     def _build_prompt(self, messages: list[BaseMessage]) -> str:
         tools_text = _tool_schema_text(self._bound_tools) if self._bound_tools else ""
-        prompt = _messages_to_prompt(messages, tools_text)
-        # Keep the prompt inside the worker's context window.
+        header, convo = _messages_to_parts(messages, tools_text)
+        # Keep the prompt inside the worker's context window, trimming
+        # oldest-first: the old code cut the END (prompt[:max_chars]),
+        # which dropped the newest user turn — the message the model has
+        # to answer — while keeping stale history.
         max_chars = self.max_context_length * 3  # ~3 chars per token, conservative
-        if len(prompt) > max_chars:
-            prompt = prompt[:max_chars] + "\nAssistant:"
-        return prompt
+        return _fit_prompt(header, convo, max_chars)
 
     def _generate(
         self,
