@@ -83,7 +83,7 @@ Chat: `POST /api/chat` (SSE stream, 30 turns/min rate-limited).
 Threads: list / messages / rename / delete / Markdown export. `GET /api/threads` takes
 `?search=` (matches titles + message content); `GET /api/threads/{id}` takes
 `?limit=&offset=` for paging history (limit clamped to 1000).
-Models: `GET /api/models` (chain health), `GET /api/stats` (usage counts per provider per day, including failed turns and average turn latency, plus per-provider totals with failure rate; `?days=` clamps to 1..365). Provider cooldowns persist in the chat DB (`provider_health` table) so a restart does not give a just-failed provider a clean slate; disable with `BRO_ROUTER_PERSIST=0`. Usage rows older than 90 days are pruned by the auto-reaper (`BRO_STATS_KEEP_DAYS` to change).
+Models: `GET /api/models` (chain health), `GET /api/stats` (usage counts per provider per day, including failed turns and average turn latency, plus per-provider totals with failure rate; `?days=` clamps to 1..365). Latency is per attempt: a failover turn charges the winning provider only its own attempt time, and each failed attempt's duration is recorded separately as `avg_fail_ms`, so a slow queue timeout on one provider never inflates another's average. Provider cooldowns persist in the chat DB (`provider_health` table) so a restart does not give a just-failed provider a clean slate; disable with `BRO_ROUTER_PERSIST=0`. Usage rows older than 90 days are pruned by the auto-reaper (`BRO_STATS_KEEP_DAYS` to change).
 Uploads: `POST /api/upload` (into `workdir/uploads/`), `GET /api/uploads` (list),
 `DELETE /api/uploads/{name}` (delete) — also shown in the ops dashboard.
 Work files: `GET /api/files` (browse the agent workdir, `?path=` subdir, dirs first),

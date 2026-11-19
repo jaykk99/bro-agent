@@ -630,14 +630,21 @@ async def chat(req: ChatRequest, request: Request):
                 order = router.chat_order()
                 messages = [{"role": m["role"], "content": m["content"]} for m in build_window(history)]
                 final_text, final_source, final_error = "", "", ""
-                turn_started = time.monotonic()
-                # Walk the provider chain: on hard error OR refusal boilerplate
-                # from ANY model (Jay's standing order — never show Jay a
-                # refusal on legit work while another provider is untried),
-                # move to the next provider instead of giving up. A refusal
-                # surfaces only when every provider in the chain refused.
+                # Per-attempt timing (not per-turn): a failover turn's
+                # duration belongs to the attempt that spent it. The old
+                # code timed from turn start, so a 60s Horde queue timeout
+                # was charged to the Pollinations turn that eventually
+                # answered, inflating its avg_ms and hiding the failure's
+                # own cost. Failed/refused attempts record their duration
+                # as fail_ms against themselves instead.
                 for i, provider in enumerate(order):
+                    attempt_started = time.monotonic()
                     await queue.put({"type": "progress", "stage": "trying", "provider": provider})
+                    # Walk the provider chain: on hard error OR refusal boilerplate
+                    # from ANY model (Jay's standing order — never show Jay a
+                    # refusal on legit work while another provider is untried),
+                    # move to the next provider instead of giving up. A refusal
+                    # surfaces only when every provider in the chain refused.
                     try:
                         # Cached agent: built once per provider, reused across
                         # turns (see app/agent.py) instead of rebuilt per turn.
@@ -651,7 +658,10 @@ async def chat(req: ChatRequest, request: Request):
                         if looks_like_refusal(text) and i < len(order) - 1:
                             logger.warning("provider %s refused legit work, skipping to next", source)
                             router.record_failure(source)
-                            stats.record_failure(source)
+                            stats.record_failure(
+                                source,
+                                duration_ms=int((time.monotonic() - attempt_started) * 1000),
+                            )
                             await queue.put(
                                 {"type": "progress", "stage": "refused", "provider": source}
                             )
@@ -662,7 +672,10 @@ async def chat(req: ChatRequest, request: Request):
                     except Exception as e:
                         logger.exception("agent turn failed on %s", provider)
                         router.record_failure(provider)
-                        stats.record_failure(provider)
+                        stats.record_failure(
+                            provider,
+                            duration_ms=int((time.monotonic() - attempt_started) * 1000),
+                        )
                         await queue.put(
                             {
                                 "type": "progress",
@@ -677,7 +690,7 @@ async def chat(req: ChatRequest, request: Request):
                     in_chars = sum(len(str(m.get("content", ""))) for m in messages)
                     stats.record_turn(
                         final_source, in_chars, len(final_text),
-                        duration_ms=int((time.monotonic() - turn_started) * 1000),
+                        duration_ms=int((time.monotonic() - attempt_started) * 1000),
                     )
                     await queue.put({"type": "done", "reply": final_text, "model": final_source})
                 else:

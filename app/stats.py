@@ -32,6 +32,7 @@ def _connect() -> sqlite3.Connection:
                 "day TEXT NOT NULL, provider TEXT NOT NULL, turns INTEGER NOT NULL DEFAULT 0, "
                 "in_chars INTEGER NOT NULL DEFAULT 0, out_chars INTEGER NOT NULL DEFAULT 0, "
                 "failures INTEGER NOT NULL DEFAULT 0, total_ms INTEGER NOT NULL DEFAULT 0, "
+                "fail_ms INTEGER NOT NULL DEFAULT 0, "
                 "PRIMARY KEY (day, provider))"
             )
             # Migrate DBs created before failures/total_ms existed: the
@@ -41,6 +42,13 @@ def _connect() -> sqlite3.Connection:
                 _conn.execute("ALTER TABLE chat_stats ADD COLUMN failures INTEGER NOT NULL DEFAULT 0")
             if "total_ms" not in _cols:
                 _conn.execute("ALTER TABLE chat_stats ADD COLUMN total_ms INTEGER NOT NULL DEFAULT 0")
+            if "fail_ms" not in _cols:
+                # Failed-attempt latency: how long a provider burned before
+                # it failed (queue timeout, error, or refusal on legit
+                # work). Without it a failure is a bare count and a
+                # 60s Horde queue timeout looks identical to an instant
+                # 403 — ops cannot tell a slow outage from a fast one.
+                _conn.execute("ALTER TABLE chat_stats ADD COLUMN fail_ms INTEGER NOT NULL DEFAULT 0")
             _conn.commit()
         return _conn
 
@@ -71,19 +79,23 @@ def record_turn(
         c.commit()
 
 
-def record_failure(provider: str, day: str | None = None) -> None:
+def record_failure(provider: str, day: str | None = None, duration_ms: int = 0) -> None:
     """Count one failed turn (hard error, or a refusal on legit work that
     made the router fall through to the next provider). A day with only
     failures still shows up in the ops dashboard, so an outage is visible
-    instead of looking like no usage."""
+    instead of looking like no usage. duration_ms is how long THIS
+    attempt burned before it failed — a failed provider's latency is
+    recorded against the failure (fail_ms), never folded into the next
+    provider's successful-turn average (see record_turn)."""
     day = day or _today()
     c = _connect()
     with _lock:
         c.execute(
-            "INSERT INTO chat_stats (day, provider, turns, in_chars, out_chars, failures, total_ms)"
-            " VALUES (?, ?, 0, 0, 0, 1, 0)"
-            " ON CONFLICT(day, provider) DO UPDATE SET failures=failures+1",
-            (day, provider or "unknown"),
+            "INSERT INTO chat_stats (day, provider, turns, in_chars, out_chars, failures, total_ms, fail_ms)"
+            " VALUES (?, ?, 0, 0, 0, 1, 0, ?)"
+            " ON CONFLICT(day, provider) DO UPDATE SET"
+            " failures=failures+1, fail_ms=fail_ms+excluded.fail_ms",
+            (day, provider or "unknown", max(0, duration_ms)),
         )
         c.commit()
 
@@ -93,7 +105,7 @@ def get_stats(days: int = 14) -> list[dict]:
     days = max(1, days)
     cutoff = (datetime.date.today() - datetime.timedelta(days=days - 1)).isoformat()
     rows = c.execute(
-        "SELECT day, provider, turns, in_chars, out_chars, failures, total_ms"
+        "SELECT day, provider, turns, in_chars, out_chars, failures, total_ms, fail_ms"
         " FROM chat_stats WHERE day >= ? ORDER BY day DESC, provider ASC",
         (cutoff,),
     ).fetchall()
@@ -101,6 +113,7 @@ def get_stats(days: int = 14) -> list[dict]:
     for r in rows:
         d = dict(r)
         d["avg_ms"] = round(d["total_ms"] / d["turns"]) if d["turns"] else 0
+        d["avg_fail_ms"] = round(d["fail_ms"] / d["failures"]) if d["failures"] else 0
         out.append(d)
     return out
 
@@ -110,14 +123,18 @@ def get_summary(days: int = 14) -> list[dict]:
     turn latency, and failure rate (failures / turns+failures). One row
     per provider with any activity in the window — the ops dashboard
     totals line. A provider that only failed still shows up, with
-    failure_rate 1.0, so an outage reads as an outage, not as no usage."""
+    failure_rate 1.0, so an outage reads as an outage, not as no usage.
+    avg_fail_ms is the mean latency of that provider's FAILED attempts —
+    kept separate from avg_ms, which covers only successful turns (a
+    failover turn's wasted time belongs to the provider that wasted it,
+    not to the one that eventually answered)."""
     c = _connect()
     days = max(1, days)
     cutoff = (datetime.date.today() - datetime.timedelta(days=days - 1)).isoformat()
     rows = c.execute(
         "SELECT provider, SUM(turns) AS turns, SUM(failures) AS failures,"
         " SUM(in_chars) AS in_chars, SUM(out_chars) AS out_chars,"
-        " SUM(total_ms) AS total_ms"
+        " SUM(total_ms) AS total_ms, SUM(fail_ms) AS fail_ms"
         " FROM chat_stats WHERE day >= ? GROUP BY provider ORDER BY provider ASC",
         (cutoff,),
     ).fetchall()
@@ -126,6 +143,7 @@ def get_summary(days: int = 14) -> list[dict]:
         d = dict(r)
         attempts = (d["turns"] or 0) + (d["failures"] or 0)
         d["avg_ms"] = round(d["total_ms"] / d["turns"]) if d["turns"] else 0
+        d["avg_fail_ms"] = round(d["fail_ms"] / d["failures"]) if d["failures"] else 0
         d["failure_rate"] = round(d["failures"] / attempts, 4) if attempts else 0.0
         out.append(d)
     return out
