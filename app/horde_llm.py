@@ -381,6 +381,45 @@ def _parse_status_payload(s: dict) -> str | None:
     return None
 
 
+def _log_queue_progress(job_id: str, s: dict) -> None:
+    """Debug-log where the job sits in the Horde queue, when the payload says.
+
+    Queue depth is the only signal for whether a slow job is moving or
+    stuck — without it a 60s wait is a black box in the logs.
+    """
+    qp = s.get("queue_position")
+    wt = s.get("wait_time")
+    if qp is None and wt is None:
+        return
+    logger.debug("horde: job %s queue_position=%s wait_time=%s", job_id, qp, wt)
+
+
+def _cancel_job(client, api: str, headers: dict, job_id: str) -> None:
+    """Best-effort DELETE of a Horde job nobody waits for any more.
+
+    A job that timed out, hit a sick status endpoint, or was refused by
+    the edge would otherwise stay queued/running on a community worker
+    until Horde reaps it — occupying capacity for an answer no one will
+    read. The Horde API cancels via DELETE /generate/text/status/{id}.
+    Best-effort on purpose: a failed cancel must never mask the real
+    error that abandoned the job, so every failure is swallowed.
+    """
+    try:
+        client.delete(f"{api}/generate/text/status/{job_id}", headers=headers)
+        logger.info("horde: cancelled orphaned job %s", job_id)
+    except Exception:
+        logger.debug("horde: cancel of job %s failed (best-effort)", job_id, exc_info=True)
+
+
+async def _acancel_job(client, api: str, headers: dict, job_id: str) -> None:
+    """Async twin of _cancel_job — same best-effort DELETE."""
+    try:
+        await client.delete(f"{api}/generate/text/status/{job_id}", headers=headers)
+        logger.info("horde: cancelled orphaned job %s", job_id)
+    except Exception:
+        logger.debug("horde: cancel of job %s failed (best-effort)", job_id, exc_info=True)
+
+
 async def _ahorde_generate_on(api: str, headers: dict, submit_body: dict, timeout_s: int) -> str:
     async with httpx.AsyncClient(timeout=30, headers={"User-Agent": HORDE_USER_AGENT}) as client:
         sub = await client.post(f"{api}/generate/text/async", headers=headers, json=submit_body)
@@ -400,6 +439,9 @@ async def _ahorde_generate_on(api: str, headers: dict, submit_body: dict, timeou
             await asyncio.sleep(4)
             chk = await client.get(f"{api}/generate/text/status/{job_id}", headers=poll_headers)
             if chk.status_code == 403:
+                # The job may still be queued — cancel it before raising
+                # so it does not keep occupying a worker.
+                await _acancel_job(client, api, poll_headers, job_id)
                 raise RuntimeError("horde: 403 forbidden on status poll")
             if chk.status_code != 200:
                 # Fail fast on a persistently sick status endpoint: a
@@ -408,19 +450,40 @@ async def _ahorde_generate_on(api: str, headers: dict, submit_body: dict, timeou
                 # timeout (60s) before the router can fail over to
                 # Pollinations — while also misreporting the failure as
                 # a slow queue ("timed out"). Three bad polls in a row
-                # (~12s) is a real outage, not a blip: raise so the
-                # host failover tries the next Horde host. A single bad
-                # poll is tolerated (the counter resets on any 200).
+                # (~12s) is a real outage, not a blip: cancel the job
+                # and raise so the host failover tries the next Horde
+                # host. A single bad poll is tolerated (the counter
+                # resets on any 200).
                 bad_polls += 1
                 if bad_polls >= POLL_ERROR_THRESHOLD:
+                    await _acancel_job(client, api, poll_headers, job_id)
                     raise RuntimeError(
                         f"horde: status poll failed {bad_polls}x in a row (last: {chk.status_code})"
                     )
                 continue
+            try:
+                s = chk.json()
+            except ValueError:
+                # A 200 that is not JSON is transient garbage, not a
+                # dead host: count it like any other bad poll instead
+                # of aborting the whole call on one corrupt reply.
+                # (The counter resets only on a good parse below — a
+                # reset here would cap it at 1 and never fail fast.)
+                bad_polls += 1
+                if bad_polls >= POLL_ERROR_THRESHOLD:
+                    await _acancel_job(client, api, poll_headers, job_id)
+                    raise RuntimeError(
+                        f"horde: status poll returned non-JSON {bad_polls}x in a row"
+                    )
+                continue
             bad_polls = 0
-            text = _parse_status_payload(chk.json())
+            _log_queue_progress(job_id, s)
+            text = _parse_status_payload(s)
             if text is not None:
                 return text
+        # Deadline hit: the job is still queued/running on Horde — cancel
+        # it instead of orphaning worker capacity on a job nobody waits for.
+        await _acancel_job(client, api, poll_headers, job_id)
     raise RuntimeError("horde: timed out waiting for generation")
 
 
@@ -443,22 +506,45 @@ def _horde_generate_on(api: str, headers: dict, submit_body: dict, timeout_s: in
             time.sleep(4)
             chk = client.get(f"{api}/generate/text/status/{job_id}", headers=poll_headers)
             if chk.status_code == 403:
+                # The job may still be queued — cancel it before raising
+                # so it does not keep occupying a worker.
+                _cancel_job(client, api, poll_headers, job_id)
                 raise RuntimeError("horde: 403 forbidden on status poll")
             if chk.status_code != 200:
                 # Fail fast, same reason as the async twin above: a
                 # persistently sick status endpoint must trigger host
                 # failover now, not after the whole timeout is burned.
+                # Cancel the job first so the worker is freed.
                 bad_polls += 1
                 if bad_polls >= POLL_ERROR_THRESHOLD:
+                    _cancel_job(client, api, poll_headers, job_id)
                     raise RuntimeError(
                         f"horde: status poll failed {bad_polls}x in a row (last: {chk.status_code})"
                     )
                 continue
+            try:
+                s = chk.json()
+            except ValueError:
+                # A 200 that is not JSON is transient garbage, not a
+                # dead host: count it like any other bad poll instead
+                # of aborting the whole call on one corrupt reply.
+                # (The counter resets only on a good parse below — a
+                # reset here would cap it at 1 and never fail fast.)
+                bad_polls += 1
+                if bad_polls >= POLL_ERROR_THRESHOLD:
+                    _cancel_job(client, api, poll_headers, job_id)
+                    raise RuntimeError(
+                        f"horde: status poll returned non-JSON {bad_polls}x in a row"
+                    )
+                continue
             bad_polls = 0
-            s = chk.json()
+            _log_queue_progress(job_id, s)
             text = _parse_status_payload(s)
             if text is not None:
                 return text
+        # Deadline hit: the job is still queued/running on Horde — cancel
+        # it instead of orphaning worker capacity on a job nobody waits for.
+        _cancel_job(client, api, poll_headers, job_id)
     raise RuntimeError("horde: timed out waiting for generation")
 
 

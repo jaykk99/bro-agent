@@ -652,3 +652,259 @@ def test_horde_generate_on_tolerates_transient_poll_errors(monkeypatch):
     monkeypatch.setattr(horde.time, "sleep", lambda _s: None)
     text = _horde_generate_on("https://x.example/api/v2", {"apikey": "k"}, {"prompt": "hi"}, 60)
     assert text == "sync recovered"
+
+
+# ---- orphaned-job cancellation ----
+# Before this fix a Horde job that timed out, hit a sick status endpoint,
+# or was 403'd on poll was simply abandoned: it stayed queued/running on
+# a community worker until Horde reaped it, occupying capacity for an
+# answer nobody would ever read. The poll loops now DELETE the job
+# (DELETE /generate/text/status/{id}) on every abandon path, best-effort
+# so a failed cancel never masks the real error. A job that finishes
+# normally is never cancelled, and a cancel that itself fails is swallowed.
+
+
+class _SyncDeleteMixin:
+    """Records DELETE calls; mixes into the sync fakes above."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.deletes: list[tuple[str, dict | None]] = []
+
+    def delete(self, url, headers=None):
+        self.deletes.append((url, headers))
+        return _HttpErrorResp(200, {})
+
+
+class _AsyncDeleteMixin:
+    """Async twin of _SyncDeleteMixin."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.deletes: list[tuple[str, dict | None]] = []
+
+    async def delete(self, url, headers=None):
+        self.deletes.append((url, headers))
+        return _FakeResp(200, {})
+
+
+class _TimeoutSyncClient(_SyncDeleteMixin, _FakeSyncClient):
+    """Submit ok, polls stay pending forever."""
+
+    def get(self, url, headers=None):
+        return _HttpErrorResp(200, {"done": False, "queue_position": 3, "wait_time": 42})
+
+
+class _TimeoutAsyncClient(_AsyncDeleteMixin, _FakeAsyncClient):
+    async def get(self, url, headers=None):
+        return _FakeResp(200, {"done": False, "queue_position": 3, "wait_time": 42})
+
+
+def _cancel_url(client):
+    assert len(client.deletes) == 1
+    url, headers = client.deletes[0]
+    assert url == "https://x.example/api/v2/generate/text/status/job-1"
+    assert headers and headers.get("apikey") == "k"
+    return url
+
+
+def test_horde_generate_on_cancels_job_on_timeout(monkeypatch):
+    # timeout_s=0: the poll loop never runs, so the job is abandoned
+    # immediately — the cancel must still fire before the raise.
+    client = _TimeoutSyncClient()
+    monkeypatch.setattr(horde.httpx, "Client", lambda *a, **k: client)
+    monkeypatch.setattr(horde.time, "sleep", lambda _s: None)
+    try:
+        _horde_generate_on("https://x.example/api/v2", {"apikey": "k"}, {"prompt": "hi"}, 0)
+    except RuntimeError as e:
+        assert "timed out" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+    _cancel_url(client)
+
+
+def test_ahorde_generate_on_cancels_job_on_timeout(monkeypatch):
+    client = _TimeoutAsyncClient()
+    monkeypatch.setattr(horde.httpx, "AsyncClient", lambda *a, **k: client)
+    monkeypatch.setattr(horde.asyncio, "sleep", _no_sleep)
+    try:
+        asyncio.run(_ahorde_generate_on("https://x.example/api/v2", {"apikey": "k"}, {"prompt": "hi"}, 0))
+    except RuntimeError as e:
+        assert "timed out" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+    _cancel_url(client)
+
+
+def test_horde_generate_on_cancels_job_on_poll_fail_fast(monkeypatch):
+    class Sick(_SyncDeleteMixin, _PollSickSyncClient):
+        pass
+
+    client = Sick(status=500)
+    monkeypatch.setattr(horde.httpx, "Client", lambda *a, **k: client)
+    monkeypatch.setattr(horde.time, "sleep", lambda _s: None)
+    try:
+        _horde_generate_on("https://x.example/api/v2", {"apikey": "k"}, {"prompt": "hi"}, 60)
+    except RuntimeError as e:
+        assert "status poll failed" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+    assert client.polls == horde.POLL_ERROR_THRESHOLD
+    _cancel_url(client)
+
+
+def test_ahorde_generate_on_cancels_job_on_poll_fail_fast(monkeypatch):
+    class Sick(_AsyncDeleteMixin, _PollSickAsyncClient):
+        pass
+
+    client = Sick(status=500)
+    monkeypatch.setattr(horde.httpx, "AsyncClient", lambda *a, **k: client)
+    monkeypatch.setattr(horde.asyncio, "sleep", _no_sleep)
+    try:
+        asyncio.run(_ahorde_generate_on("https://x.example/api/v2", {"apikey": "k"}, {"prompt": "hi"}, 60))
+    except RuntimeError as e:
+        assert "status poll failed" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+    assert client.polls == horde.POLL_ERROR_THRESHOLD
+    _cancel_url(client)
+
+
+def test_horde_generate_on_cancels_job_on_poll_403(monkeypatch):
+    class Forbidden(_SyncDeleteMixin, _FakeSyncClient):
+        def get(self, url, headers=None):
+            return _HttpErrorResp(403)
+
+    client = Forbidden()
+    monkeypatch.setattr(horde.httpx, "Client", lambda *a, **k: client)
+    monkeypatch.setattr(horde.time, "sleep", lambda _s: None)
+    try:
+        _horde_generate_on("https://x.example/api/v2", {"apikey": "k"}, {"prompt": "hi"}, 60)
+    except RuntimeError as e:
+        assert "403" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+    _cancel_url(client)
+
+
+def test_ahorde_generate_on_cancels_job_on_poll_403(monkeypatch):
+    class Forbidden(_AsyncDeleteMixin, _FakeAsyncClient):
+        async def get(self, url, headers=None):
+            return _FakeResp(403, {})
+
+    client = Forbidden()
+    monkeypatch.setattr(horde.httpx, "AsyncClient", lambda *a, **k: client)
+    monkeypatch.setattr(horde.asyncio, "sleep", _no_sleep)
+    try:
+        asyncio.run(_ahorde_generate_on("https://x.example/api/v2", {"apikey": "k"}, {"prompt": "hi"}, 60))
+    except RuntimeError as e:
+        assert "403" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+    _cancel_url(client)
+
+
+class _DoneSyncClient(_SyncDeleteMixin, _FakeSyncClient):
+    pass  # _FakeSyncClient.get answers done on the first poll
+
+
+class _DoneAsyncClient(_AsyncDeleteMixin, _FakeAsyncClient):
+    pass  # one pending poll, then done
+
+
+def test_horde_generate_on_no_cancel_when_done(monkeypatch):
+    # A job that finishes normally is never cancelled.
+    client = _DoneSyncClient()
+    monkeypatch.setattr(horde.httpx, "Client", lambda *a, **k: client)
+    monkeypatch.setattr(horde.time, "sleep", lambda _s: None)
+    text = _horde_generate_on("https://x.example/api/v2", {"apikey": "k"}, {"prompt": "hi"}, 60)
+    assert text == "sync hello"
+    assert client.deletes == []
+
+
+def test_ahorde_generate_on_no_cancel_when_done(monkeypatch):
+    client = _DoneAsyncClient()
+    monkeypatch.setattr(horde.httpx, "AsyncClient", lambda *a, **k: client)
+    monkeypatch.setattr(horde.asyncio, "sleep", _no_sleep)
+    text = asyncio.run(_ahorde_generate_on("https://x.example/api/v2", {"apikey": "k"}, {"prompt": "hi"}, 60))
+    assert text == "async hello"
+    assert client.deletes == []
+
+
+def test_cancel_failure_is_swallowed(monkeypatch):
+    # A cancel that itself blows up must not mask the real error: the
+    # caller still sees "timed out", and the client without a delete
+    # method at all (old fakes) must not break the fail-fast path either.
+    client = _TimeoutSyncClient()
+    client.delete = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("delete down"))
+    monkeypatch.setattr(horde.httpx, "Client", lambda *a, **k: client)
+    monkeypatch.setattr(horde.time, "sleep", lambda _s: None)
+    try:
+        _horde_generate_on("https://x.example/api/v2", {"apikey": "k"}, {"prompt": "hi"}, 0)
+    except RuntimeError as e:
+        assert "timed out" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+# ---- non-JSON 200 on a status poll ----
+# A 200 whose body is not JSON used to raise ValueError out of the poll
+# loop and abort the whole call (failing over to the next host) on one
+# corrupt reply. Now it counts as a bad poll like any other: a couple of
+# blips recover, three in a row fail fast (and cancel the job).
+
+
+class _NonJsonThenOkSync(_SyncDeleteMixin, _FakeSyncClient):
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.polls = 0
+
+    def get(self, url, headers=None):
+        self.polls += 1
+        if self.polls <= 2:
+            return _BadJsonResp()
+        return _HttpErrorResp(200, {"done": True, "generations": [{"text": "sync recovered"}]})
+
+
+class _NonJsonThenOkAsync(_AsyncDeleteMixin, _FakeAsyncClient):
+    async def get(self, url, headers=None):
+        self.polls += 1
+        if self.polls <= 2:
+            return _BadJsonResp()
+        return _FakeResp(200, {"done": True, "generations": [{"text": "async recovered"}]})
+
+
+def test_horde_generate_on_tolerates_non_json_poll_then_recovers(monkeypatch):
+    client = _NonJsonThenOkSync()
+    monkeypatch.setattr(horde.httpx, "Client", lambda *a, **k: client)
+    monkeypatch.setattr(horde.time, "sleep", lambda _s: None)
+    text = _horde_generate_on("https://x.example/api/v2", {"apikey": "k"}, {"prompt": "hi"}, 60)
+    assert text == "sync recovered"
+    assert client.deletes == []  # recovered: nothing to cancel
+
+
+def test_ahorde_generate_on_tolerates_non_json_poll_then_recovers(monkeypatch):
+    client = _NonJsonThenOkAsync()
+    monkeypatch.setattr(horde.httpx, "AsyncClient", lambda *a, **k: client)
+    monkeypatch.setattr(horde.asyncio, "sleep", _no_sleep)
+    text = asyncio.run(_ahorde_generate_on("https://x.example/api/v2", {"apikey": "k"}, {"prompt": "hi"}, 60))
+    assert text == "async recovered"
+    assert client.deletes == []
+
+
+class _NonJsonAlwaysSync(_SyncDeleteMixin, _FakeSyncClient):
+    def get(self, url, headers=None):
+        return _BadJsonResp()
+
+
+def test_horde_generate_on_fails_fast_on_repeated_non_json_poll(monkeypatch):
+    client = _NonJsonAlwaysSync()
+    monkeypatch.setattr(horde.httpx, "Client", lambda *a, **k: client)
+    monkeypatch.setattr(horde.time, "sleep", lambda _s: None)
+    try:
+        _horde_generate_on("https://x.example/api/v2", {"apikey": "k"}, {"prompt": "hi"}, 60)
+    except RuntimeError as e:
+        assert "non-JSON" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+    _cancel_url(client)
