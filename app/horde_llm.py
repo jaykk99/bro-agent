@@ -73,29 +73,52 @@ _models_cache: tuple[float, list[str]] | None = None
 
 
 def _fetch_live_models(http_get=None) -> list[str]:
-    """Query the Horde model list; return online uncensored model names."""
+    """Query the Horde model list; return online uncensored model names.
+
+    Tries each known Horde API host in turn: some networks get 403s from
+    one host's edge (Cloudflare IP filtering) while the other works, and
+    a refresh that only ever asked the blocked host silently fell back
+    to the hardcoded list every 6h even though the live list was one
+    host away. Raises the last error when every host fails, so the
+    caller falls back to the hardcoded list; a host that answers but
+    lists no online uncensored models is tried next too, and an empty
+    result from all hosts returns [] (the caller treats that as no
+    refresh, same as before).
+    """
     get = http_get or httpx.get
-    r = get(
-        "https://stablehorde.net/api/v2/status/models",
-        headers={"User-Agent": HORDE_USER_AGENT},
-        timeout=15,
-    )
-    r.raise_for_status()
-    data = r.json()
-    items = data if isinstance(data, list) else []
-    live: list[tuple[int, str]] = []
-    for it in items:
-        name = str(it.get("name", ""))
-        workers = int(it.get("count", 0) or 0)
-        if workers <= 0:
+    last_error: Exception | None = None
+    for base in ("https://stablehorde.net", "https://aihorde.net"):
+        try:
+            r = get(
+                f"{base}/api/v2/status/models",
+                headers={"User-Agent": HORDE_USER_AGENT},
+                timeout=15,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            last_error = e
+            logger.debug("horde: live model refresh failed on %s: %s", base, e)
             continue
-        lname = name.lower()
-        if any(h in lname for h in _UNCENSORED_HINTS):
-            # prefer koboldcpp-served models (text gen), then most workers
-            prio = 0 if lname.startswith("koboldcpp/") else 1
-            live.append((prio, -workers, name))
-    live.sort()
-    return [name for _, _, name in live]
+        items = data if isinstance(data, list) else []
+        live: list[tuple[int, str]] = []
+        for it in items:
+            name = str(it.get("name", ""))
+            workers = int(it.get("count", 0) or 0)
+            if workers <= 0:
+                continue
+            lname = name.lower()
+            if any(h in lname for h in _UNCENSORED_HINTS):
+                # prefer koboldcpp-served models (text gen), then most workers
+                prio = 0 if lname.startswith("koboldcpp/") else 1
+                live.append((prio, -workers, name))
+        live.sort()
+        if live:
+            return [name for _, _, name in live]
+        logger.debug("horde: %s listed no online uncensored models", base)
+    if last_error is not None:
+        raise last_error
+    return []
 
 
 def resolve_models(configured: list[str], http_get=None) -> list[str]:

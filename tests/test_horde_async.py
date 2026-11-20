@@ -908,3 +908,57 @@ def test_horde_generate_on_fails_fast_on_repeated_non_json_poll(monkeypatch):
     else:
         raise AssertionError("expected RuntimeError")
     _cancel_url(client)
+
+
+# ---- live model refresh tries both Horde hosts ----
+# _fetch_live_models only ever asked stablehorde.net, so a network whose
+# edge 403s that host never got a live refresh and silently fell back
+# to the hardcoded list every 6h. Now the second host is tried before
+# giving up.
+
+
+def test_fetch_live_models_tries_second_host():
+    horde._models_cache = None
+    payload = [
+        {"name": "koboldcpp/L3-8B-Stheno-v3.2", "count": 12},
+        {"name": "aphrodite/My-Heretic-Merge", "count": 5},
+    ]
+    calls: list[str] = []
+
+    def get(url, headers=None, timeout=None):
+        calls.append(url)
+        if "stablehorde" in url:
+            raise RuntimeError("edge blocked")
+        return _fake_http_get(payload)(url, headers=headers, timeout=timeout)
+
+    got = horde.resolve_models(horde.HORDE_UNCENSORED_MODELS, http_get=get)
+    assert got == ["koboldcpp/L3-8B-Stheno-v3.2", "aphrodite/My-Heretic-Merge"]
+    assert any("stablehorde" in u for u in calls)
+    assert any("aihorde" in u for u in calls)
+
+
+def test_fetch_live_models_both_hosts_down_falls_back():
+    horde._models_cache = None
+
+    def bad(*a, **k):
+        raise RuntimeError("network down")
+
+    got = horde.resolve_models(horde.HORDE_UNCENSORED_MODELS, http_get=bad)
+    assert got == horde.HORDE_UNCENSORED_MODELS
+
+
+def test_fetch_live_models_empty_first_host_tries_second():
+    # First host answers but lists nothing usable; the second host's
+    # live list must still be used, not an empty refresh.
+    horde._models_cache = None
+    payload = [{"name": "koboldcpp/L3-8B-Stheno-v3.2", "count": 12}]
+
+    def get(url, headers=None, timeout=None):
+        if "stablehorde" in url:
+            return _fake_http_get([{"name": "koboldcpp/dead-model", "count": 0}])(
+                url, headers=headers, timeout=timeout
+            )
+        return _fake_http_get(payload)(url, headers=headers, timeout=timeout)
+
+    got = horde.resolve_models(horde.HORDE_UNCENSORED_MODELS, http_get=get)
+    assert got == ["koboldcpp/L3-8B-Stheno-v3.2"]
