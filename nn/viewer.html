@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bro-agent NN — commit triage</title>
+<style>
+  body { margin:0; background:#0d1117; color:#e6edf3;
+         font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header, main { padding:20px 24px; }
+  h1 { margin:0 0 4px; font-size:22px; }
+  .sub { color:#8b949e; font-size:13px; }
+  .card { background:#161b22; border:1px solid #30363d; border-radius:8px;
+          padding:16px; margin:0 0 16px; }
+  .warn { background:#3a2b00; border:1px solid #d29922; color:#ffd479;
+          border-radius:8px; padding:12px 16px; font-size:13px; }
+  .metrics { display:flex; flex-wrap:wrap; gap:12px; }
+  .metric { flex:1 1 120px; background:#0d1117; border:1px solid #30363d;
+            border-radius:6px; padding:10px; }
+  .metric .v { font-size:22px; font-weight:700; }
+  .metric .k { color:#8b949e; font-size:12px; margin-top:2px; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { border:1px solid #30363d; padding:6px 10px; text-align:left; }
+  th { color:#8b949e; font-weight:600; }
+  code { background:#0d1117; border:1px solid #30363d; border-radius:4px;
+         padding:1px 5px; font-size:12px; }
+  ul { font-size:13px; line-height:1.6; }
+</style>
+</head>
+<body>
+<header>
+  <h1>bro-agent NN — commit triage</h1>
+  <p class="sub">Pure-stdlib MLP. Ranks commits by how much their diff stats
+  look like past test-touching commits. Triage only: it never verifies a
+  commit does (or does not) touch the tests. Train with <code>python -m nn.train</code>,
+  score with <code>python -m nn.score --sha &lt;sha&gt;</code>.</p>
+</header>
+<main>
+  <div class="card warn" id="limits"></div>
+  <div class="card"><h2 style="margin:0 0 10px;font-size:16px">Test set metrics</h2>
+    <div class="metrics" id="metrics"></div></div>
+  <div class="card"><h2 style="margin:0 0 10px;font-size:16px">Confusion (test)</h2>
+    <div id="confusion"></div></div>
+  <div class="card"><h2 style="margin:0 0 10px;font-size:16px">Feature importance (AUC drop when shuffled)</h2>
+    <div id="importance"></div></div>
+  <div class="card"><h2 style="margin:0 0 10px;font-size:16px">Dataset</h2>
+    <div id="dataset"></div></div>
+</main>
+<!-- NN-DATA-START -->
+<script type="application/json" id="nn-data">
+{
+  "trained_at": "2026-11-14T06:04:06.194138+00:00",
+  "layers": [
+    23,
+    8,
+    4,
+    1
+  ],
+  "n_features": 23,
+  "feature_names": [
+    "log_files_changed",
+    "log_insertions",
+    "log_deletions",
+    "log_total_churn",
+    "insertion_share",
+    "deletion_share",
+    "net_insertions",
+    "frac_py",
+    "frac_js_ts",
+    "frac_html_css",
+    "frac_docs",
+    "frac_config",
+    "frac_other",
+    "touches_app",
+    "touches_notebooks",
+    "touches_static",
+    "touches_root",
+    "subject_len",
+    "subject_words",
+    "has_scope_prefix",
+    "hour_of_day",
+    "is_weekend",
+    "log_distinct_top_dirs"
+  ],
+  "dataset": {
+    "repo": "/home/hatch/workspace/wt/nn-bro-agent",
+    "commits": 63,
+    "train_rows": 63,
+    "n_positive": 50,
+    "n_negative": 13,
+    "merges_excluded_note": "git log --no-merges; merge commits excluded"
+  },
+  "train_rows": 50,
+  "test_rows": 13,
+  "train_metrics": {
+    "n": 50,
+    "n_positive": 40,
+    "n_negative": 10,
+    "threshold": 0.5,
+    "accuracy": 0.9,
+    "majority_baseline_accuracy": 0.8,
+    "roc_auc": 0.8825,
+    "confusion": {
+      "tn": 5,
+      "fp": 5,
+      "fn": 0,
+      "tp": 40
+    },
+    "precision_touches_tests": 0.8888888888888888,
+    "recall_touches_tests": 1.0,
+    "f1_touches_tests": 0.9411764705882353,
+    "precision_no_tests": 1.0,
+    "recall_no_tests": 0.5,
+    "f1_no_tests": 0.6666666666666666
+  },
+  "test_metrics": {
+    "n": 13,
+    "n_positive": 10,
+    "n_negative": 3,
+    "threshold": 0.5,
+    "accuracy": 0.9230769230769231,
+    "majority_baseline_accuracy": 0.7692307692307693,
+    "roc_auc": 0.9,
+    "confusion": {
+      "tn": 2,
+      "fp": 1,
+      "fn": 0,
+      "tp": 10
+    },
+    "precision_touches_tests": 0.9090909090909091,
+    "recall_touches_tests": 1.0,
+    "f1_touches_tests": 0.9523809523809523,
+    "precision_no_tests": 1.0,
+    "recall_no_tests": 0.6666666666666666,
+    "f1_no_tests": 0.8
+  },
+  "history": {
+    "loss": [
+      0.5514419069768377,
+      0.5289411087456348,
+      0.5106451848400146,
+      0.4988768020522115,
+      0.48711458187047507,
+      0.4784598991446418,
+      0.47036502571628147,
+      0.4629743488065766,
+      0.45592039430339115,
+      0.44854831072161877,
+      0.4420849742162688,
+      0.4362642580585565,
+      0.43171013813600945,
+      0.42649481475840195,
+      0.421595359784349,
+      0.4162704757897913,
+      0.4120696843677504,
+      0.40794333861293053,
+      0.40422401109033473,
+      0.4001704494262048,
+      0.39604136016619207,
+      0.392111488366563,
+      0.38846317492311505,
+      0.3855771285618917,
+      0.382161087641547,
+      0.3793270533235065,
+      0.3759098546286854,
+      0.37248954204946405,
+      0.36988682352357954,
+      0.36706160179703756,
+      0.3643599076581859,
+      0.36175636602510075,
+      0.3595333519657167,
+      0.35709266027257996,
+      0.35500171091108507,
+      0.35275232513916627,
+      0.3507565901401773,
+      0.3485621768580461,
+      0.3461077421632411,
+      0.3438045415530206
+    ],
+    "train_acc": [
+      0.86,
+      0.86,
+      0.84,
+      0.84,
+      0.84,
+      0.84,
+      0.82,
+      0.82,
+      0.82,
+      0.82,
+      0.82,
+      0.82,
+      0.82,
+      0.84,
+      0.86,
+      0.86,
+      0.86,
+      0.86,
+      0.88,
+      0.88,
+      0.88,
+      0.88,
+      0.88,
+      0.88,
+      0.88,
+      0.88,
+      0.88,
+      0.9,
+      0.9,
+      0.9,
+      0.9,
+      0.9,
+      0.9,
+      0.9,
+      0.9,
+      0.9,
+      0.9,
+      0.9,
+      0.9,
+      0.9
+    ],
+    "val_acc": [
+      0.9230769230769231,
+      0.8461538461538461,
+      0.7692307692307693,
+      0.7692307692307693,
+      0.7692307692307693,
+      0.7692307692307693,
+      0.7692307692307693,
+      0.7692307692307693,
+      0.7692307692307693,
+      0.7692307692307693,
+      0.7692307692307693,
+      0.7692307692307693,
+      0.7692307692307693,
+      0.7692307692307693,
+      0.7692307692307693,
+      0.7692307692307693,
+      0.7692307692307693,
+      0.7692307692307693,
+      0.7692307692307693,
+      0.7692307692307693,
+      0.7692307692307693,
+      0.7692307692307693,
+      0.8461538461538461,
+      0.8461538461538461,
+      0.8461538461538461,
+      0.8461538461538461,
+      0.9230769230769231,
+      0.9230769230769231,
+      0.9230769230769231,
+      0.9230769230769231,
+      0.9230769230769231,
+      0.9230769230769231,
+      0.9230769230769231,
+      0.9230769230769231,
+      0.9230769230769231,
+      0.9230769230769231,
+      0.9230769230769231,
+      0.9230769230769231,
+      0.9230769230769231,
+      0.9230769230769231
+    ]
+  },
+  "feature_importance": [
+    {
+      "group": "distinct_top_dirs",
+      "auc_drop": 0.0667
+    },
+    {
+      "group": "diff_size",
+      "auc_drop": 0.0333
+    },
+    {
+      "group": "subject_shape",
+      "auc_drop": 0.0333
+    },
+    {
+      "group": "timestamp",
+      "auc_drop": 0.0
+    },
+    {
+      "group": "touched_areas",
+      "auc_drop": 0.0
+    },
+    {
+      "group": "file_types",
+      "auc_drop": -0.0333
+    }
+  ],
+  "limits": [
+    "Triage only. The model ranks commits by how much their diff stats look like past test-touching commits. It does not verify that a commit does (or does not) touch the tests.",
+    "Tiny, skewed data: 63 non-merge commits, ~78% touch tests, test set 13 rows. Metrics are noisy; accuracy near the 0.78 majority baseline means the model learned nothing.",
+    "Label skew: the training set is 79% touches-tests / 21% no-tests (50 touches-tests / 13 no-tests of 63 commits). Accuracy near the majority baseline means the model learned nothing; judge it by ROC AUC and per-class precision/recall.",
+    "Test-ness is never a feature (it would be the label itself). Test files still count toward the generic frac_py share, since they are Python files; that correlation is real, not leakage."
+  ],
+  "seed": 42,
+  "epochs": 40,
+  "lr": 0.05
+}
+</script>
+<!-- NN-DATA-END -->
+<script>
+const data = JSON.parse(document.getElementById('nn-data').textContent || '{}');
+const tm = data.test_metrics || {};
+const fmt = (v, d=3) => (v == null ? 'n/a' : Number(v).toFixed(d));
+function metric(v, k) {
+  return `<div class="metric"><div class="v">${v}</div><div class="k">${k}</div></div>`;
+}
+document.getElementById('metrics').innerHTML = [
+  metric(fmt(tm.accuracy), 'test accuracy'),
+  metric(fmt(tm.majority_baseline_accuracy), 'majority baseline'),
+  metric(fmt(tm.roc_auc), 'test ROC AUC'),
+  metric(fmt(tm.precision_touches_tests), 'touches-tests precision'),
+  metric(fmt(tm.recall_touches_tests), 'touches-tests recall'),
+  metric(fmt(tm.precision_no_tests), 'no-tests precision'),
+  metric(fmt(tm.recall_no_tests), 'no-tests recall'),
+  metric(`${data.train_rows || '?'} / ${data.test_rows || '?'}`, 'train / test rows'),
+].join('');
+const cm = tm.confusion || {};
+document.getElementById('confusion').innerHTML =
+  `<table><tr><th></th><th>predicted touches-tests</th><th>predicted no-tests</th></tr>
+   <tr><th>true touches-tests</th><td>${cm.tp ?? '?'}</td><td>${cm.fn ?? '?'}</td></tr>
+   <tr><th>true no-tests</th><td>${cm.fp ?? '?'}</td><td>${cm.tn ?? '?'}</td></tr></table>`;
+document.getElementById('importance').innerHTML =
+  '<table><tr><th>feature group</th><th>AUC drop</th></tr>' +
+  (data.feature_importance || []).map(d =>
+    `<tr><td>${d.group}</td><td>${d.auc_drop}</td></tr>`).join('') + '</table>';
+document.getElementById('dataset').innerHTML =
+  `<p class="sub">Layers: <code>${(data.layers || []).join('-')}</code> &middot;
+   Features: ${data.n_features || '?'} &middot; Seed ${data.seed ?? '?'} &middot;
+   Epochs ${data.epochs ?? '?'} &middot; Trained ${data.trained_at || 'not trained yet'}</p>
+   <p class="sub">Source: git history of this repo
+   (${(data.dataset || {}).commits ?? '?'} non-merge commits,
+   ${(data.dataset || {}).n_positive ?? '?'} touches-tests /
+   ${(data.dataset || {}).n_negative ?? '?'} no-tests).</p>`;
+document.getElementById('limits').innerHTML =
+  '<b>Triage only.</b><ul>' + (data.limits || ['Train first: python -m nn.train'])
+    .map(l => `<li>${l}</li>`).join('') + '</ul>';
+</script>
+</body>
+</html>
