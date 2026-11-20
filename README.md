@@ -14,9 +14,9 @@ computer (terminal + filesystem), web browsing, and Composio integrations.
    prompt-side since Horde workers don't do native function calling.
    Slower than Pollinations, but uncensored with zero keys. A free
    `HORDE_API_KEY` (optional) gets better queue priority. Jobs abandoned
-   on timeout, sick status polls, or a 403 are cancelled on Horde
-   (`DELETE /generate/text/status/{id}`) so they don't keep occupying
-   community workers.
+   on timeout, sick status polls, a 403, or a client disconnect mid-turn
+   are cancelled on Horde (`DELETE /generate/text/status/{id}`) so they
+   don't keep occupying community workers.
 
 The router (`app/router.py`) orders providers healthy-first: two consecutive
 failures cools a provider down for 5 minutes. If a fallback model's turn comes

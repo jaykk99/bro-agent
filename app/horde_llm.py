@@ -458,52 +458,62 @@ async def _ahorde_generate_on(api: str, headers: dict, submit_body: dict, timeou
         poll_headers = {"apikey": headers["apikey"], "User-Agent": HORDE_USER_AGENT}
         deadline = time.time() + timeout_s
         bad_polls = 0
-        while time.time() < deadline:
-            await asyncio.sleep(4)
-            chk = await client.get(f"{api}/generate/text/status/{job_id}", headers=poll_headers)
-            if chk.status_code == 403:
-                # The job may still be queued — cancel it before raising
-                # so it does not keep occupying a worker.
-                await _acancel_job(client, api, poll_headers, job_id)
-                raise RuntimeError("horde: 403 forbidden on status poll")
-            if chk.status_code != 200:
-                # Fail fast on a persistently sick status endpoint: a
-                # 429/5xx on every poll means this host is not serving
-                # jobs right now, and swallowing it burns the whole
-                # timeout (60s) before the router can fail over to
-                # Pollinations — while also misreporting the failure as
-                # a slow queue ("timed out"). Three bad polls in a row
-                # (~12s) is a real outage, not a blip: cancel the job
-                # and raise so the host failover tries the next Horde
-                # host. A single bad poll is tolerated (the counter
-                # resets on any 200).
-                bad_polls += 1
-                if bad_polls >= POLL_ERROR_THRESHOLD:
+        try:
+            while time.time() < deadline:
+                await asyncio.sleep(4)
+                chk = await client.get(f"{api}/generate/text/status/{job_id}", headers=poll_headers)
+                if chk.status_code == 403:
+                    # The job may still be queued — cancel it before raising
+                    # so it does not keep occupying a worker.
                     await _acancel_job(client, api, poll_headers, job_id)
-                    raise RuntimeError(
-                        f"horde: status poll failed {bad_polls}x in a row (last: {chk.status_code})"
-                    )
-                continue
-            try:
-                s = chk.json()
-            except ValueError:
-                # A 200 that is not JSON is transient garbage, not a
-                # dead host: count it like any other bad poll instead
-                # of aborting the whole call on one corrupt reply.
-                # (The counter resets only on a good parse below — a
-                # reset here would cap it at 1 and never fail fast.)
-                bad_polls += 1
-                if bad_polls >= POLL_ERROR_THRESHOLD:
-                    await _acancel_job(client, api, poll_headers, job_id)
-                    raise RuntimeError(
-                        f"horde: status poll returned non-JSON {bad_polls}x in a row"
-                    )
-                continue
-            bad_polls = 0
-            _log_queue_progress(job_id, s)
-            text = _parse_status_payload(s)
-            if text is not None:
-                return text
+                    raise RuntimeError("horde: 403 forbidden on status poll")
+                if chk.status_code != 200:
+                    # Fail fast on a persistently sick status endpoint: a
+                    # 429/5xx on every poll means this host is not serving
+                    # jobs right now, and swallowing it burns the whole
+                    # timeout (60s) before the router can fail over to
+                    # Pollinations — while also misreporting the failure as
+                    # a slow queue ("timed out"). Three bad polls in a row
+                    # (~12s) is a real outage, not a blip: cancel the job
+                    # and raise so the host failover tries the next Horde
+                    # host. A single bad poll is tolerated (the counter
+                    # resets on any good parse).
+                    bad_polls += 1
+                    if bad_polls >= POLL_ERROR_THRESHOLD:
+                        await _acancel_job(client, api, poll_headers, job_id)
+                        raise RuntimeError(
+                            f"horde: status poll failed {bad_polls}x in a row (last: {chk.status_code})"
+                        )
+                    continue
+                try:
+                    s = chk.json()
+                except ValueError:
+                    # A 200 that is not JSON is transient garbage, not a
+                    # dead host: count it like any other bad poll instead
+                    # of aborting the whole call on one corrupt reply.
+                    # (The counter resets only on a good parse below — a
+                    # reset here would cap it at 1 and never fail fast.)
+                    bad_polls += 1
+                    if bad_polls >= POLL_ERROR_THRESHOLD:
+                        await _acancel_job(client, api, poll_headers, job_id)
+                        raise RuntimeError(
+                            f"horde: status poll returned non-JSON {bad_polls}x in a row"
+                        )
+                    continue
+                bad_polls = 0
+                _log_queue_progress(job_id, s)
+                text = _parse_status_payload(s)
+                if text is not None:
+                    return text
+        except asyncio.CancelledError:
+            # The chat stream was cancelled (client disconnected, turn
+            # timed out at the agent level): the job would otherwise
+            # keep running on a worker for an answer nobody reads.
+            # Shield the DELETE so the in-flight cancellation does not
+            # cut the cleanup short, then re-raise so the cancellation
+            # still propagates to the caller.
+            await asyncio.shield(_acancel_job(client, api, poll_headers, job_id))
+            raise
         # Deadline hit: the job is still queued/running on Horde — cancel
         # it instead of orphaning worker capacity on a job nobody waits for.
         await _acancel_job(client, api, poll_headers, job_id)

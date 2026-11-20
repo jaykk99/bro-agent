@@ -962,3 +962,30 @@ def test_fetch_live_models_empty_first_host_tries_second():
 
     got = horde.resolve_models(horde.HORDE_UNCENSORED_MODELS, http_get=get)
     assert got == ["koboldcpp/L3-8B-Stheno-v3.2"]
+
+
+# ---- cancel on task cancellation (client disconnect) ----
+# When the chat client goes away mid-turn, main.py cancels the agent
+# task; CancelledError then propagates through the poll loop. Without
+# cleanup the Horde job keeps running for an answer nobody reads.
+
+
+class _CancelRaisingAsyncClient(_AsyncDeleteMixin, _FakeAsyncClient):
+    async def get(self, url, headers=None):
+        self.polls += 1
+        if self.polls >= 2:
+            raise asyncio.CancelledError()
+        return _FakeResp(200, {"done": False, "wait_time": 1})
+
+
+def test_ahorde_generate_on_cancels_job_on_task_cancel(monkeypatch):
+    client = _CancelRaisingAsyncClient()
+    monkeypatch.setattr(horde.httpx, "AsyncClient", lambda *a, **k: client)
+    monkeypatch.setattr(horde.asyncio, "sleep", _no_sleep)
+    try:
+        asyncio.run(_ahorde_generate_on("https://x.example/api/v2", {"apikey": "k"}, {"prompt": "hi"}, 60))
+    except asyncio.CancelledError:
+        pass
+    else:
+        raise AssertionError("expected CancelledError")
+    _cancel_url(client)
