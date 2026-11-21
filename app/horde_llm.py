@@ -72,6 +72,72 @@ _UNCENSORED_HINTS = ("stheno", "heretic", "rocinante", "uncensored")
 _models_cache: tuple[float, list[str]] | None = None
 
 
+def invalidate_models_cache() -> None:
+    """Drop the cached live-model list so the next call re-refreshes it.
+
+    Called when a Horde job times out: a timeout usually means the
+    requested models are dead or stuck in the queue, and reusing the
+    same cached list for up to 6h would repeat the failure on every
+    turn. The next resolve_models() call re-asks the live API.
+    """
+    global _models_cache
+    _models_cache = None
+
+
+# Poll pacing: a job deep in the queue (queue_position > 0) is not going
+# to finish in the next 2s, so polling every 4s wastes requests on a
+# community API; a job already running (queue_position 0) finishes soon,
+# so poll faster to return the answer sooner. Unknown position keeps 4s.
+POLL_INTERVAL_RUNNING_S = 2.0
+POLL_INTERVAL_DEFAULT_S = 4.0
+POLL_INTERVAL_QUEUED_S = 6.0
+
+
+def _poll_interval_s(status: dict | None) -> float:
+    """Seconds to wait before the next status poll, from the last payload."""
+    if not isinstance(status, dict):
+        return POLL_INTERVAL_DEFAULT_S
+    qp = status.get("queue_position")
+    if qp is None:
+        return POLL_INTERVAL_DEFAULT_S
+    try:
+        qp = int(qp)
+    except (TypeError, ValueError):
+        return POLL_INTERVAL_DEFAULT_S
+    return POLL_INTERVAL_RUNNING_S if qp <= 0 else POLL_INTERVAL_QUEUED_S
+
+
+def _retry_after_s(resp: Any, cap_s: float = 10.0) -> float | None:
+    """Seconds to wait from a 429's Retry-After header, capped.
+
+    Returns None when the header is missing or unparseable — the caller
+    then fails over immediately instead of guessing a wait. A huge
+    Retry-After (an edge telling us to go away for minutes) is capped:
+    the router's job is to fail over to the next host/provider, not to
+    sit out a long ban on one host.
+    """
+    headers = getattr(resp, "headers", None) or {}
+    raw = headers.get("Retry-After") or headers.get("retry-after")
+    if raw is None:
+        return None
+    try:
+        seconds = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    return min(seconds, cap_s)
+
+
+def _check_submit_response(resp: Any) -> None:
+    """Raise for a submit response that cannot proceed (403/429/other error)."""
+    if resp.status_code == 403:
+        raise RuntimeError("horde: 403 forbidden on submit (edge blocked this network)")
+    if resp.status_code == 429:
+        raise RuntimeError("horde: rate limited on submit (429)")
+    resp.raise_for_status()
+
+
 def _fetch_live_models(http_get=None) -> list[str]:
     """Query the Horde model list; return online uncensored model names.
 
@@ -331,27 +397,33 @@ def _submit_headers(api_key: str) -> dict:
 
 
 def _submit_body(prompt: str, models: list[str], max_context_length: int,
-                 max_length: int, temperature: float) -> dict:
+                 max_length: int, temperature: float, stop: list[str] | None = None) -> dict:
+    params: dict[str, Any] = {
+        "max_context_length": max_context_length,
+        "max_length": max_length,
+        "temperature": temperature,
+    }
+    if stop:
+        # Horde's param name is stop_sequence (koboldcpp-style); the
+        # LangChain `stop` list maps straight onto it.
+        params["stop_sequence"] = list(stop)
     return {
         "prompt": prompt,
-        "params": {
-            "max_context_length": max_context_length,
-            "max_length": max_length,
-            "temperature": temperature,
-        },
+        "params": params,
         "models": models,
     }
 
 
 def _horde_generate(prompt: str, models: list[str], max_context_length: int,
-                    max_length: int, temperature: float, timeout_s: int) -> str:
+                    max_length: int, temperature: float, timeout_s: int,
+                    stop: list[str] | None = None) -> str:
     """Submit a prompt to AI Horde and poll until done. Raises on failure.
 
     Tries each known Horde API host in turn — some networks get 403s from
     one host's edge (Cloudflare IP filtering) while the other works."""
     api_key = _horde_key()
     headers = _submit_headers(api_key)
-    body = _submit_body(prompt, models, max_context_length, max_length, temperature)
+    body = _submit_body(prompt, models, max_context_length, max_length, temperature, stop=stop)
     last_error: Exception | None = None
     for api in HORDE_APIS:
         try:
@@ -368,7 +440,8 @@ def _horde_generate(prompt: str, models: list[str], max_context_length: int,
 
 
 async def _ahorde_generate(prompt: str, models: list[str], max_context_length: int,
-                           max_length: int, temperature: float, timeout_s: int) -> str:
+                           max_length: int, temperature: float, timeout_s: int,
+                           stop: list[str] | None = None) -> str:
     """Async twin of _horde_generate — same failover, non-blocking polls.
 
     The sync version sleeps the calling thread between polls; inside the
@@ -378,7 +451,7 @@ async def _ahorde_generate(prompt: str, models: list[str], max_context_length: i
     """
     api_key = _horde_key()
     headers = _submit_headers(api_key)
-    body = _submit_body(prompt, models, max_context_length, max_length, temperature)
+    body = _submit_body(prompt, models, max_context_length, max_length, temperature, stop=stop)
     last_error: Exception | None = None
     for api in HORDE_APIS:
         try:
@@ -446,11 +519,17 @@ async def _acancel_job(client, api: str, headers: dict, job_id: str) -> None:
 async def _ahorde_generate_on(api: str, headers: dict, submit_body: dict, timeout_s: int) -> str:
     async with httpx.AsyncClient(timeout=30, headers={"User-Agent": HORDE_USER_AGENT}) as client:
         sub = await client.post(f"{api}/generate/text/async", headers=headers, json=submit_body)
-        if sub.status_code == 403:
-            raise RuntimeError("horde: 403 forbidden on submit (edge blocked this network)")
         if sub.status_code == 429:
-            raise RuntimeError("horde: rate limited on submit (429)")
-        sub.raise_for_status()
+            # One bounded retry on the same host when the edge says how
+            # long to wait: a short rate-limit blip should not burn a
+            # host failover. No/invalid Retry-After (or a second 429)
+            # fails over immediately via _check_submit_response.
+            wait = _retry_after_s(sub)
+            if wait is not None:
+                logger.info("horde: rate limited on submit, retrying once after %.1fs", wait)
+                await asyncio.sleep(wait)
+                sub = await client.post(f"{api}/generate/text/async", headers=headers, json=submit_body)
+        _check_submit_response(sub)
         job_id = sub.json().get("id")
         if not job_id:
             raise RuntimeError("horde: no job id returned")
@@ -458,9 +537,10 @@ async def _ahorde_generate_on(api: str, headers: dict, submit_body: dict, timeou
         poll_headers = {"apikey": headers["apikey"], "User-Agent": HORDE_USER_AGENT}
         deadline = time.time() + timeout_s
         bad_polls = 0
+        last_status: dict | None = None
         try:
             while time.time() < deadline:
-                await asyncio.sleep(4)
+                await asyncio.sleep(_poll_interval_s(last_status))
                 chk = await client.get(f"{api}/generate/text/status/{job_id}", headers=poll_headers)
                 if chk.status_code == 403:
                     # The job may still be queued — cancel it before raising
@@ -501,6 +581,7 @@ async def _ahorde_generate_on(api: str, headers: dict, submit_body: dict, timeou
                         )
                     continue
                 bad_polls = 0
+                last_status = s
                 _log_queue_progress(job_id, s)
                 text = _parse_status_payload(s)
                 if text is not None:
@@ -517,17 +598,23 @@ async def _ahorde_generate_on(api: str, headers: dict, submit_body: dict, timeou
         # Deadline hit: the job is still queued/running on Horde — cancel
         # it instead of orphaning worker capacity on a job nobody waits for.
         await _acancel_job(client, api, poll_headers, job_id)
+        # The models we queued on may be dead: drop the cached live list
+        # so the next turn re-refreshes instead of re-queueing on them.
+        invalidate_models_cache()
     raise RuntimeError("horde: timed out waiting for generation")
 
 
 def _horde_generate_on(api: str, headers: dict, submit_body: dict, timeout_s: int) -> str:
     with httpx.Client(timeout=30, headers={"User-Agent": HORDE_USER_AGENT}) as client:
         sub = client.post(f"{api}/generate/text/async", headers=headers, json=submit_body)
-        if sub.status_code == 403:
-            raise RuntimeError("horde: 403 forbidden on submit (edge blocked this network)")
         if sub.status_code == 429:
-            raise RuntimeError("horde: rate limited on submit (429)")
-        sub.raise_for_status()
+            # One bounded retry on the same host — see the async twin.
+            wait = _retry_after_s(sub)
+            if wait is not None:
+                logger.info("horde: rate limited on submit, retrying once after %.1fs", wait)
+                time.sleep(wait)
+                sub = client.post(f"{api}/generate/text/async", headers=headers, json=submit_body)
+        _check_submit_response(sub)
         job_id = sub.json().get("id")
         if not job_id:
             raise RuntimeError("horde: no job id returned")
@@ -535,8 +622,9 @@ def _horde_generate_on(api: str, headers: dict, submit_body: dict, timeout_s: in
         poll_headers = {"apikey": headers["apikey"], "User-Agent": HORDE_USER_AGENT}
         deadline = time.time() + timeout_s
         bad_polls = 0
+        last_status: dict | None = None
         while time.time() < deadline:
-            time.sleep(4)
+            time.sleep(_poll_interval_s(last_status))
             chk = client.get(f"{api}/generate/text/status/{job_id}", headers=poll_headers)
             if chk.status_code == 403:
                 # The job may still be queued — cancel it before raising
@@ -571,6 +659,7 @@ def _horde_generate_on(api: str, headers: dict, submit_body: dict, timeout_s: in
                     )
                 continue
             bad_polls = 0
+            last_status = s
             _log_queue_progress(job_id, s)
             text = _parse_status_payload(s)
             if text is not None:
@@ -578,6 +667,9 @@ def _horde_generate_on(api: str, headers: dict, submit_body: dict, timeout_s: in
         # Deadline hit: the job is still queued/running on Horde — cancel
         # it instead of orphaning worker capacity on a job nobody waits for.
         _cancel_job(client, api, poll_headers, job_id)
+        # The models we queued on may be dead: drop the cached live list
+        # so the next turn re-refreshes instead of re-queueing on them.
+        invalidate_models_cache()
     raise RuntimeError("horde: timed out waiting for generation")
 
 
@@ -648,6 +740,7 @@ class HordeChatModel(BaseChatModel):
             max_length=self.max_length,
             temperature=self.temperature,
             timeout_s=self.timeout_s,
+            stop=stop,
         )
         return self._to_chat_result(text)
 
@@ -674,6 +767,7 @@ class HordeChatModel(BaseChatModel):
             max_length=self.max_length,
             temperature=self.temperature,
             timeout_s=self.timeout_s,
+            stop=stop,
         )
         return self._to_chat_result(text)
 
