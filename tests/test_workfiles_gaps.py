@@ -57,8 +57,13 @@ def test_open_work_file_fstat_failure_closes_fd_and_raises(root, monkeypatch):
         raise OSError("fstat down")
 
     monkeypatch.setattr(os, "fstat", boom)
-    with pytest.raises(OSError, match="fstat down"):
-        workfiles.open_work_file(root, "a.txt")
+    try:
+        with pytest.raises(OSError, match="fstat down"):
+            workfiles.open_work_file(root, "a.txt")
+    finally:
+        # os.fstat is patched process-wide, so restore it before pytest's
+        # own teardown touches it and reports a spurious failure.
+        monkeypatch.undo()
 
 
 def test_open_work_file_directory_is_rejected(root):
