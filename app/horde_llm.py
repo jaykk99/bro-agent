@@ -169,8 +169,13 @@ def _fetch_live_models(http_get=None) -> list[str]:
         items = data if isinstance(data, list) else []
         live: list[tuple[int, str]] = []
         for it in items:
-            name = str(it.get("name", ""))
-            workers = int(it.get("count", 0) or 0)
+            try:
+                name = str(it.get("name", ""))
+                workers = int(it.get("count", 0) or 0)
+            except (AttributeError, TypeError, ValueError):
+                # One malformed entry (not a dict, non-numeric count)
+                # must not abort the whole refresh: skip it.
+                continue
             if workers <= 0:
                 continue
             lname = name.lower()
@@ -471,8 +476,16 @@ def _parse_status_payload(s: dict) -> str | None:
         raise RuntimeError("horde: job faulted")
     if s.get("done"):
         gens = s.get("generations") or []
-        if gens and gens[0].get("text"):
-            return gens[0]["text"]
+        # The payload comes from a community API: generations may be a
+        # non-list, hold non-dicts, or carry a non-string "text". Any of
+        # those used to raise AttributeError/TypeError out of gens[0].get
+        # or hand a non-str downstream — treat them all as "no usable
+        # generation" instead of crashing on the shape.
+        text = None
+        if isinstance(gens, list) and gens and isinstance(gens[0], dict):
+            text = gens[0].get("text")
+        if isinstance(text, str) and text:
+            return text
         raise RuntimeError("horde: done but empty generation")
     return None
 
@@ -530,7 +543,10 @@ async def _ahorde_generate_on(api: str, headers: dict, submit_body: dict, timeou
                 await asyncio.sleep(wait)
                 sub = await client.post(f"{api}/generate/text/async", headers=headers, json=submit_body)
         _check_submit_response(sub)
-        job_id = sub.json().get("id")
+        sub_data = sub.json()
+        # A 200 with a non-dict body (list, string) has no job id: say so
+        # instead of raising AttributeError on .get.
+        job_id = sub_data.get("id") if isinstance(sub_data, dict) else None
         if not job_id:
             raise RuntimeError("horde: no job id returned")
 
@@ -541,7 +557,15 @@ async def _ahorde_generate_on(api: str, headers: dict, submit_body: dict, timeou
         try:
             while time.time() < deadline:
                 await asyncio.sleep(_poll_interval_s(last_status))
-                chk = await client.get(f"{api}/generate/text/status/{job_id}", headers=poll_headers)
+                try:
+                    chk = await client.get(f"{api}/generate/text/status/{job_id}", headers=poll_headers)
+                except httpx.HTTPError as e:
+                    # The status endpoint went unreachable mid-poll (connect
+                    # error, read timeout): the job is still queued/running
+                    # on a worker, so cancel it instead of orphaning it,
+                    # then raise so the caller fails over to the next host.
+                    await _acancel_job(client, api, poll_headers, job_id)
+                    raise RuntimeError(f"horde: status poll transport error: {e}") from e
                 if chk.status_code == 403:
                     # The job may still be queued — cancel it before raising
                     # so it does not keep occupying a worker.
@@ -615,7 +639,10 @@ def _horde_generate_on(api: str, headers: dict, submit_body: dict, timeout_s: in
                 time.sleep(wait)
                 sub = client.post(f"{api}/generate/text/async", headers=headers, json=submit_body)
         _check_submit_response(sub)
-        job_id = sub.json().get("id")
+        sub_data = sub.json()
+        # A 200 with a non-dict body (list, string) has no job id: say so
+        # instead of raising AttributeError on .get.
+        job_id = sub_data.get("id") if isinstance(sub_data, dict) else None
         if not job_id:
             raise RuntimeError("horde: no job id returned")
 
@@ -623,47 +650,62 @@ def _horde_generate_on(api: str, headers: dict, submit_body: dict, timeout_s: in
         deadline = time.time() + timeout_s
         bad_polls = 0
         last_status: dict | None = None
-        while time.time() < deadline:
-            time.sleep(_poll_interval_s(last_status))
-            chk = client.get(f"{api}/generate/text/status/{job_id}", headers=poll_headers)
-            if chk.status_code == 403:
-                # The job may still be queued — cancel it before raising
-                # so it does not keep occupying a worker.
-                _cancel_job(client, api, poll_headers, job_id)
-                raise RuntimeError("horde: 403 forbidden on status poll")
-            if chk.status_code != 200:
-                # Fail fast, same reason as the async twin above: a
-                # persistently sick status endpoint must trigger host
-                # failover now, not after the whole timeout is burned.
-                # Cancel the job first so the worker is freed.
-                bad_polls += 1
-                if bad_polls >= POLL_ERROR_THRESHOLD:
+        try:
+            while time.time() < deadline:
+                time.sleep(_poll_interval_s(last_status))
+                try:
+                    chk = client.get(f"{api}/generate/text/status/{job_id}", headers=poll_headers)
+                except httpx.HTTPError as e:
+                    # The status endpoint went unreachable mid-poll (connect
+                    # error, read timeout): the job is still queued/running
+                    # on a worker, so cancel it instead of orphaning it,
+                    # then raise so the caller fails over to the next host.
                     _cancel_job(client, api, poll_headers, job_id)
-                    raise RuntimeError(
-                        f"horde: status poll failed {bad_polls}x in a row (last: {chk.status_code})"
-                    )
-                continue
-            try:
-                s = chk.json()
-            except ValueError:
-                # A 200 that is not JSON is transient garbage, not a
-                # dead host: count it like any other bad poll instead
-                # of aborting the whole call on one corrupt reply.
-                # (The counter resets only on a good parse below — a
-                # reset here would cap it at 1 and never fail fast.)
-                bad_polls += 1
-                if bad_polls >= POLL_ERROR_THRESHOLD:
+                    raise RuntimeError(f"horde: status poll transport error: {e}") from e
+                if chk.status_code == 403:
+                    # The job may still be queued — cancel it before raising
+                    # so it does not keep occupying a worker.
                     _cancel_job(client, api, poll_headers, job_id)
-                    raise RuntimeError(
-                        f"horde: status poll returned non-JSON {bad_polls}x in a row"
-                    )
-                continue
-            bad_polls = 0
-            last_status = s
-            _log_queue_progress(job_id, s)
-            text = _parse_status_payload(s)
-            if text is not None:
-                return text
+                    raise RuntimeError("horde: 403 forbidden on status poll")
+                if chk.status_code != 200:
+                    # Fail fast, same reason as the async twin above: a
+                    # persistently sick status endpoint must trigger host
+                    # failover now, not after the whole timeout is burned.
+                    # Cancel the job first so the worker is freed.
+                    bad_polls += 1
+                    if bad_polls >= POLL_ERROR_THRESHOLD:
+                        _cancel_job(client, api, poll_headers, job_id)
+                        raise RuntimeError(
+                            f"horde: status poll failed {bad_polls}x in a row (last: {chk.status_code})"
+                        )
+                    continue
+                try:
+                    s = chk.json()
+                except ValueError:
+                    # A 200 that is not JSON is transient garbage, not a
+                    # dead host: count it like any other bad poll instead
+                    # of aborting the whole call on one corrupt reply.
+                    # (The counter resets only on a good parse below — a
+                    # reset here would cap it at 1 and never fail fast.)
+                    bad_polls += 1
+                    if bad_polls >= POLL_ERROR_THRESHOLD:
+                        _cancel_job(client, api, poll_headers, job_id)
+                        raise RuntimeError(
+                            f"horde: status poll returned non-JSON {bad_polls}x in a row"
+                        )
+                    continue
+                bad_polls = 0
+                last_status = s
+                _log_queue_progress(job_id, s)
+                text = _parse_status_payload(s)
+                if text is not None:
+                    return text
+        except KeyboardInterrupt:
+            # Ctrl-C in the CLI (or a SIGINT anywhere) mid-poll: the job
+            # would otherwise keep running on a worker for an answer
+            # nobody reads. Cancel it, then let the interrupt propagate.
+            _cancel_job(client, api, poll_headers, job_id)
+            raise
         # Deadline hit: the job is still queued/running on Horde — cancel
         # it instead of orphaning worker capacity on a job nobody waits for.
         _cancel_job(client, api, poll_headers, job_id)
