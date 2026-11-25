@@ -64,12 +64,25 @@ HORDE_UNCENSORED_MODELS = [
 # workers online right now (cached 6h), falling back to the hardcoded list
 # when the API is unreachable.
 MODELS_CACHE_S = 6 * 3600
+# Failed-refresh retry: a failed refresh used to cache the hardcoded
+# fallback for the full 6h, so a transient outage (both hosts 403ing for
+# five minutes, a blip on the model endpoint) pinned every turn to the
+# stale hardcoded list until the cache expired — even though the live API
+# was back minutes later. A failure is now retried after 5 minutes
+# instead: short enough to recover promptly, long enough that a down
+# endpoint is not re-asked on every single turn.
+MODELS_CACHE_RETRY_S = 5 * 60
 # Status-poll fail-fast: consecutive non-200 (non-403) poll responses
 # before the host is declared sick and the call fails over (see
 # _horde_generate_on / _ahorde_generate_on).
 POLL_ERROR_THRESHOLD = 3
 _UNCENSORED_HINTS = ("stheno", "heretic", "rocinante", "uncensored")
 _models_cache: tuple[float, list[str]] | None = None
+# When the last live-model refresh failed (epoch seconds, None = never).
+# resolve_models() skips re-asking the API until MODELS_CACHE_RETRY_S
+# have passed, then retries instead of serving the stale fallback for
+# the rest of the 6h window.
+_models_refresh_failed_at: float | None = None
 
 
 def invalidate_models_cache() -> None:
@@ -78,10 +91,14 @@ def invalidate_models_cache() -> None:
     Called when a Horde job times out: a timeout usually means the
     requested models are dead or stuck in the queue, and reusing the
     same cached list for up to 6h would repeat the failure on every
-    turn. The next resolve_models() call re-asks the live API.
+    turn. The next resolve_models() call re-asks the live API. Also
+    clears the failed-refresh record, so a timeout after a failed
+    refresh still re-asks immediately instead of waiting out the
+    5-minute retry window.
     """
-    global _models_cache
+    global _models_cache, _models_refresh_failed_at
     _models_cache = None
+    _models_refresh_failed_at = None
 
 
 # Poll pacing: a job deep in the queue (queue_position > 0) is not going
@@ -200,21 +217,34 @@ def resolve_models(configured: list[str], http_get=None) -> list[str]:
     Custom lists are used as-is. Never returns empty — falls back to the
     hardcoded list when the API fails.
     """
-    global _models_cache
+    global _models_cache, _models_refresh_failed_at
     if configured != HORDE_UNCENSORED_MODELS:
         return configured
     now = time.time()
     if _models_cache and now - _models_cache[0] < MODELS_CACHE_S:
         return _models_cache[1]
+    if (
+        _models_refresh_failed_at is not None
+        and now - _models_refresh_failed_at < MODELS_CACHE_RETRY_S
+    ):
+        # The last refresh failed very recently: don't hammer a down
+        # endpoint on every turn, but don't pin the fallback for 6h
+        # either — the next call past the retry window re-asks.
+        return HORDE_UNCENSORED_MODELS
     try:
         live = _fetch_live_models(http_get)
         if live:
             _models_cache = (now, live)
+            _models_refresh_failed_at = None
             logger.info("horde: refreshed model list (%d live uncensored)", len(live))
             return live
     except Exception as e:
         logger.warning("horde: live model refresh failed, using defaults: %s", e)
-    _models_cache = (now, HORDE_UNCENSORED_MODELS)
+    # Failed (or empty) refresh: record the failure and return the
+    # fallback WITHOUT caching it for 6h — caching it here is what
+    # pinned the stale list until the window expired. The retry window
+    # above is the only thing that delays the next attempt.
+    _models_refresh_failed_at = now
     return HORDE_UNCENSORED_MODELS
 
 TOOL_CALL_FENCE_RE = re.compile(r"```tool_call\s*\n?(.*?)```", re.DOTALL)
@@ -472,6 +502,11 @@ async def _ahorde_generate(prompt: str, models: list[str], max_context_length: i
 
 def _parse_status_payload(s: dict) -> str | None:
     """Returns the generation text when the job is done, else None. Raises on fault."""
+    if not isinstance(s, dict):
+        # The status payload comes from a community API: a 200 whose
+        # JSON is a list/string/number has no fields to read. Say so
+        # instead of raising AttributeError on s.get() below.
+        raise RuntimeError("horde: malformed status payload (not an object)")
     if s.get("faulted"):
         raise RuntimeError("horde: job faulted")
     if s.get("done"):
@@ -604,6 +639,21 @@ async def _ahorde_generate_on(api: str, headers: dict, submit_body: dict, timeou
                             f"horde: status poll returned non-JSON {bad_polls}x in a row"
                         )
                     continue
+                if not isinstance(s, dict):
+                    # A 200 whose JSON is not an object (list, string,
+                    # number) is the same transient garbage: count it
+                    # like a non-JSON reply. The old code fell through
+                    # to _log_queue_progress(s).get() and raised
+                    # AttributeError — which skipped the cancel below
+                    # and orphaned the still-queued job on the worker
+                    # while aborting the host attempt outright.
+                    bad_polls += 1
+                    if bad_polls >= POLL_ERROR_THRESHOLD:
+                        await _acancel_job(client, api, poll_headers, job_id)
+                        raise RuntimeError(
+                            f"horde: status poll returned non-dict JSON {bad_polls}x in a row"
+                        )
+                    continue
                 bad_polls = 0
                 last_status = s
                 _log_queue_progress(job_id, s)
@@ -692,6 +742,21 @@ def _horde_generate_on(api: str, headers: dict, submit_body: dict, timeout_s: in
                         _cancel_job(client, api, poll_headers, job_id)
                         raise RuntimeError(
                             f"horde: status poll returned non-JSON {bad_polls}x in a row"
+                        )
+                    continue
+                if not isinstance(s, dict):
+                    # A 200 whose JSON is not an object (list, string,
+                    # number) is the same transient garbage: count it
+                    # like a non-JSON reply. The old code fell through
+                    # to _log_queue_progress(s).get() and raised
+                    # AttributeError — which skipped the cancel below
+                    # and orphaned the still-queued job on the worker
+                    # while aborting the host attempt outright.
+                    bad_polls += 1
+                    if bad_polls >= POLL_ERROR_THRESHOLD:
+                        _cancel_job(client, api, poll_headers, job_id)
+                        raise RuntimeError(
+                            f"horde: status poll returned non-dict JSON {bad_polls}x in a row"
                         )
                     continue
                 bad_polls = 0

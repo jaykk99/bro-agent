@@ -30,6 +30,23 @@ logger = logging.getLogger(__name__)
 POLLINATIONS_API_URL = "https://text.pollinations.ai/openai"
 POLLINATIONS_MODEL = "openai"  # resolves to gpt-oss-20b, open weights; most aligned in pool, fallback only
 
+# Per-request timeout for the Pollinations leg (seconds). ChatOpenAI
+# without one leaves the underlying client timeout at None, which the
+# OpenAI SDK defaults to 600s — the same as the whole turn timeout — so
+# a hung fallback leg held the turn for the full 600s before the router
+# could fail over (and the turn timeout then killed the failover too).
+# 120s bounds one leg: a hung Pollinations call fails in 2 minutes and
+# the chat loop moves on to Horde. Override with
+# BRO_POLLINATIONS_TIMEOUT_S; Horde's own cap stays at HORDE_TIMEOUT_S.
+POLLINATIONS_TIMEOUT_S = 120
+
+
+def _pollinations_timeout() -> float:
+    try:
+        return max(1, float(os.environ.get("BRO_POLLINATIONS_TIMEOUT_S", POLLINATIONS_TIMEOUT_S)))
+    except ValueError:
+        return float(POLLINATIONS_TIMEOUT_S)
+
 SYSTEM_PROMPT = """You are bro — Jay's personal AI agent. You get things done.
 
 How you act:
@@ -67,6 +84,7 @@ def _pollinations_model() -> Any:
         base_url=POLLINATIONS_API_URL,
         api_key="not-needed",  # Pollinations anon tier needs no key
         temperature=0.7,
+        request_timeout=_pollinations_timeout(),
     )
 
 
