@@ -327,12 +327,14 @@ def _fake_http_get(payload, status=200):
 
 def test_resolve_models_custom_list_passthrough():
     horde._models_cache = None
+    horde._models_refresh_failed_at = None
     custom = ["koboldcpp/MyModel"]
     assert horde.resolve_models(custom) == custom
 
 
 def test_resolve_models_live_refresh(monkeypatch):
     horde._models_cache = None
+    horde._models_refresh_failed_at = None
     payload = [
         {"name": "koboldcpp/L3-8B-Stheno-v3.2", "count": 12},
         {"name": "koboldcpp/dead-model", "count": 0},  # no workers -> excluded
@@ -350,6 +352,7 @@ def test_resolve_models_live_refresh(monkeypatch):
 
 def test_resolve_models_falls_back_on_api_failure():
     horde._models_cache = None
+    horde._models_refresh_failed_at = None
 
     def bad(*a, **k):
         raise RuntimeError("network down")
@@ -919,6 +922,7 @@ def test_horde_generate_on_fails_fast_on_repeated_non_json_poll(monkeypatch):
 
 def test_fetch_live_models_tries_second_host():
     horde._models_cache = None
+    horde._models_refresh_failed_at = None
     payload = [
         {"name": "koboldcpp/L3-8B-Stheno-v3.2", "count": 12},
         {"name": "aphrodite/My-Heretic-Merge", "count": 5},
@@ -939,6 +943,7 @@ def test_fetch_live_models_tries_second_host():
 
 def test_fetch_live_models_both_hosts_down_falls_back():
     horde._models_cache = None
+    horde._models_refresh_failed_at = None
 
     def bad(*a, **k):
         raise RuntimeError("network down")
@@ -951,6 +956,7 @@ def test_fetch_live_models_empty_first_host_tries_second():
     # First host answers but lists nothing usable; the second host's
     # live list must still be used, not an empty refresh.
     horde._models_cache = None
+    horde._models_refresh_failed_at = None
     payload = [{"name": "koboldcpp/L3-8B-Stheno-v3.2", "count": 12}]
 
     def get(url, headers=None, timeout=None):

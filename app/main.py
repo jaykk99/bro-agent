@@ -655,6 +655,28 @@ async def chat(req: ChatRequest, request: Request):
                             stream_agent_turn(agent, messages, queue.put),
                             timeout=turn_timeout,
                         )
+                        if not (text or "").strip():
+                            # An empty reply is a failed attempt, not an
+                            # answer: the provider returned nothing (the
+                            # same empty-generation case Horde raises for,
+                            # but Pollinations surfaces as ""). The old
+                            # code recorded it as a SUCCESS, never tried
+                            # the next provider, and told Jay "all
+                            # providers failed" with no provider having
+                            # actually failed. Fail over instead, and
+                            # only surface an error when every provider
+                            # came back empty.
+                            logger.warning("provider %s returned an empty reply, failing over", source)
+                            router.record_failure(source)
+                            stats.record_failure(
+                                source,
+                                duration_ms=int((time.monotonic() - attempt_started) * 1000),
+                            )
+                            await queue.put(
+                                {"type": "progress", "stage": "empty", "provider": source}
+                            )
+                            final_error = f"{source} returned an empty reply"
+                            continue
                         if looks_like_refusal(text) and i < len(order) - 1:
                             logger.warning("provider %s refused legit work, skipping to next", source)
                             router.record_failure(source)

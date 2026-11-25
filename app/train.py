@@ -111,14 +111,30 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
         if isinstance(parsed, dict):
             for name in sorted(parsed):
                 entry = parsed[name]
-                if isinstance(entry, dict) and entry.get("sha256"):
-                    d["adapter_files"].append(
-                        {
-                            "name": name,
-                            "sha256": entry["sha256"],
-                            "bytes": int(entry.get("bytes") or 0),
-                        }
-                    )
+                if not isinstance(entry, dict):
+                    continue
+                sha = entry.get("sha256")
+                if not isinstance(sha, str) or not sha:
+                    # A stored hash that is not a string is not
+                    # verifiable: skip the entry instead of surfacing
+                    # a non-string hash to downloaders.
+                    continue
+                try:
+                    nbytes = int(entry.get("bytes") or 0)
+                except (TypeError, ValueError):
+                    # Corrupt stored size (e.g. a hand-edited row, or
+                    # a partial write): degrade to 0 like corrupt
+                    # metrics JSON degrades to None above. The old
+                    # code raised ValueError out of int() here, which
+                    # 500d GET /api/train/{id} for the whole job.
+                    nbytes = 0
+                d["adapter_files"].append(
+                    {
+                        "name": name,
+                        "sha256": sha,
+                        "bytes": max(0, nbytes),
+                    }
+                )
     return d
 
 

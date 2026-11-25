@@ -529,7 +529,9 @@ def test_forge_register_and_finished_round_trip():
     assert r.json() == {"ok": True}
 
 
-# ---- module entry point (lines 1098-1100) ----
+# ---- module entry point (lines 1119/1120/1122) ----
+# (Was 1098-1100 before the 2026-11-25 empty-reply failover added 22
+# lines above this block; the pin tracks the __main__ guard lines.)
 # The subprocess runs under coverage too, so the __main__ guard lines
 # are measured, not just the server startup: SIGINT gives uvicorn a
 # clean shutdown, which lets coverage write its data file.
@@ -587,4 +589,4 @@ def test_main_entrypoint_starts_uvicorn(tmp_path):
     _filename, _stmts, _excluded, missing, _misf = cov.analysis2(
         os.path.join(os.path.dirname(__file__), "..", "app", "main.py")
     )
-    assert 1098 not in missing and 1099 not in missing and 1100 not in missing
+    assert 1119 not in missing and 1120 not in missing and 1122 not in missing
